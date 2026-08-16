@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+*.env
+# Node / Next.js
+node_modules/
+.next/
+out/
+.vercel/
+npm-debug.log*
+# Secrets / local
+.env.local
+.env*.local
+*.local
+# OS
+.DS_Store
