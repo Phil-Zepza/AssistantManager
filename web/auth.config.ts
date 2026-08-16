@@ -5,6 +5,10 @@ import type { NextAuthConfig } from "next-auth";
 // The adapter and the Resend provider are added in auth.ts, which only runs in
 // the Node.js runtime (route handlers + server components/actions).
 export const authConfig = {
+  // Trust the incoming Host header. Vercel sets this implicitly, but being
+  // explicit keeps the edge middleware from throwing `UntrustedHost` behind
+  // proxies / custom domains / preview URLs where auto-detection can miss.
+  trustHost: true,
   pages: {
     signIn: "/login",
   },
