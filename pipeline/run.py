@@ -211,16 +211,20 @@ def step3_player_ep(conn, bootstrap, fixture_rows, exp_goals_by_fixture, next_gw
         team_fixture_xg[fx["home_team"]].append((exp_h, exp_a))  # home: for=h, against=a
         team_fixture_xg[fx["away_team"]].append((exp_a, exp_h))  # away: for=a, against=h
 
+    # games each team has played (denominator for minutes-based nailed-ness)
+    team_games = models.team_games_played(bootstrap["elements"])
+
     ep_rows = []
     for e in bootstrap["elements"]:
         fixtures_for_team = team_fixture_xg.get(e["team"], [])
+        tg = team_games.get(e["team"])
         if not fixtures_for_team:
             # blank GW for this player's team -> 0 EP
             ep = 0.0
         else:
             # double GWs: sum EP across each fixture the team plays
             ep = sum(
-                models.compute_player_ep(e, gf, ga) for gf, ga in fixtures_for_team
+                models.compute_player_ep(e, gf, ga, tg) for gf, ga in fixtures_for_team
             )
         ep_rows.append(
             {
