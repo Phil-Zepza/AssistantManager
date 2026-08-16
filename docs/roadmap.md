@@ -6,7 +6,7 @@ Work is split into streams, one PR at a time. **FPL first, then LMS.**
 | ID | Task | Status |
 |----|------|--------|
 | FPL-0  | Validate & tune the projection model (fix inflated projections) | prompt issued |
-| FPL-1a | Squad picker: manual entry (`/squad/edit`) | in review (PR — manual picker); optimizer split to FPL-1b |
+| FPL-1a | Squad picker: manual entry (`/squad/edit`) | in review ([PR #2](https://github.com/Phil-Zepza/AssistantManager/pull/2)); optimizer split to FPL-1b |
 | FPL-1b | Strategy-aware optimizer (auto-suggest optimal £100m squad) | next |
 | FPL-1  | Recommendation engine: best XI, captain/vice, best transfer (−4 maths) | queued |
 | FPL-2  | Chip strategy advice (WC / BB / TC / FH timing from fixtures) | backlog |

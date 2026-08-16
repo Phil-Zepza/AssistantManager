@@ -7,7 +7,7 @@ Append new tasks at the bottom. See `dev-workflow.md` for the format and PR rule
 |---|------|-------|----------|--------|----|
 | CC-1 | Fix crashing Auth.js middleware | Opus | think hard | merged | d716b18 (pushed direct, pre-PR-convention) |
 | CC-2 | FPL-0: validate & tune projection model | Opus | think hard | issued | — |
-| CC-3 | FPL-1a: manual squad picker (optimizer split to CC-3b) | Opus | think hard | in review | PR_URL_PLACEHOLDER |
+| CC-3 | FPL-1a: manual squad picker (optimizer split to CC-3b) | Opus | think hard | in review | https://github.com/Phil-Zepza/AssistantManager/pull/2 |
 | CC-4 | FPL-1: recommendation engine (XI, captain, transfer) | Opus | think hard | queued | — |
 
 ---
@@ -66,7 +66,7 @@ Prompt:
 ---
 
 ## CC-3 — FPL-1a: manual squad picker  (Model: Opus · think hard)
-Status: IN REVIEW (PR: PR_URL_PLACEHOLDER). Scope was split: this PR ships the **manual** squad picker
+Status: IN REVIEW (PR: https://github.com/Phil-Zepza/AssistantManager/pull/2). Scope was split: this PR ships the **manual** squad picker
 only; the **strategy-aware optimizer** is deferred to a separate follow-up (tracked as CC-3b) so users
 can load their 15 players now (the FPL picks endpoint returns nothing pre-deadline, so `user_squad` is
 empty until then).
