@@ -149,12 +149,18 @@ def step2_elo_and_fixture_probs(conn, bootstrap, fixture_rows):
     elo = models.update_elo(elo, finished)
     strengths = models.team_strengths_from_elo(elo)
 
-    # persist Elo + derived attack/defence ratings back onto teams
+    # persist Elo + derived attack/defence ratings back onto teams.
+    # Include name/short_name so the INSERT candidate satisfies NOT NULL
+    # (ON CONFLICT still just updates the rows already inserted in step 1).
+    team_meta = {t["id"]: t for t in bootstrap["teams"]}
     team_updates = []
     for tid, (attack, defence) in strengths.items():
+        meta = team_meta.get(tid, {})
         team_updates.append(
             {
                 "fpl_id": tid,
+                "name": meta.get("name"),
+                "short_name": meta.get("short_name"),
                 "elo": round(elo[tid], 1),
                 "strength_attack": round(attack, 3),
                 "strength_defence": round(defence, 3),
