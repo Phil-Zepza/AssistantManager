@@ -122,6 +122,38 @@ export interface SquadEntry {
   on_bench: boolean;
 }
 
+// Next fixture for a player's team, with a difficulty indicator.
+export interface NextFixtureInfo {
+  fixture_id: number;
+  gw: number | null;
+  is_home: boolean;
+  opponent: Team | null;
+  // FPL fixture-difficulty rating (1 easy … 5 hard) faced by this player's team.
+  difficulty: number | null;
+  // Optional model win probability for this player's team in the fixture.
+  win_prob: number | null;
+}
+
+// A selectable player in the manual squad picker: player + club + projection +
+// next fixture. Reference/model data (open to any signed-in user).
+export interface PickPoolEntry {
+  player: Player;
+  team: Team | null;
+  expected_points: number | null;
+  next_fixture: NextFixtureInfo | null;
+}
+
+// One row of an edited squad, as sent from the client to the save action.
+// Mirrors the persistable columns of user_squad exactly (no bench-order column
+// exists in the schema, so bench order is a live editor helper only — it is not
+// persisted).
+export interface SquadSelection {
+  playerId: number;
+  onBench: boolean;
+  isCaptain: boolean;
+  isVice: boolean;
+}
+
 export interface TransferSuggestion {
   position: Position;
   player: Player;

@@ -1,3 +1,4 @@
+import Link from "next/link";
 import { redirect } from "next/navigation";
 import { auth } from "@/auth";
 import { getCurrentGw } from "@/lib/gameweek";
@@ -124,12 +125,26 @@ export default async function DashboardPage() {
           <SectionTitle>Squad</SectionTitle>
           <EmptyState
             title="No squad loaded yet"
-            hint="Your squad appears here once the pipeline has fetched your FPL picks (available after the gameweek deadline)."
+            hint="Picks are only published by the FPL API after each gameweek deadline. Until then, enter your 15 players manually to get recommendations now."
           />
+          <Link
+            href="/squad/edit"
+            className="mt-3 inline-flex w-full items-center justify-center rounded-lg bg-brand px-4 py-2.5 font-semibold text-white sm:w-auto"
+          >
+            Pick your squad
+          </Link>
         </>
       ) : (
         <>
-          <SectionTitle>Starting XI</SectionTitle>
+          <div className="flex items-center justify-between">
+            <SectionTitle>Starting XI</SectionTitle>
+            <Link
+              href="/squad/edit"
+              className="text-sm font-medium text-brand hover:underline"
+            >
+              Edit squad
+            </Link>
+          </div>
           <div className="space-y-1.5">
             {starters
               .slice()
