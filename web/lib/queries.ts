@@ -258,6 +258,14 @@ export async function getLmsPicks(userId: number): Promise<LmsPick[]> {
   );
 }
 
+// Reference read: teams by id, for turning lms_picks.team_id into a short name
+// on the profile. Teams are shared reference data — open to any signed-in user
+// (no per-user scoping needed; the row set contains no user data).
+export async function getTeamsByIds(ids: number[]): Promise<Team[]> {
+  if (ids.length === 0) return [];
+  return q<Team>(`select * from teams where fpl_id = any($1::int[])`, [ids]);
+}
+
 // Build ranked fixture options for a GW, marking already-used teams.
 export async function getLmsFixtureOptions(
   gw: number,

@@ -24,6 +24,7 @@ Work is split into streams, one PR at a time. **FPL first, then LMS.**
 | X-1 | History / accuracy: back-fill recommendations_log.outcome + /history view | backlog |
 | X-2 | Weekly scheduled reminder before deadlines | backlog |
 | X-3 | Hardening: log the middleware auth-catch instead of swallowing it | backlog |
+| X-4 | Profile UI: onboarding + profile canvas (season history, LMS status, edit → squad re-import) | in review |
 
 ## Product decisions baked in
 - Squad picker: **strategy-aware optimizer** (not just manual entry).
