@@ -132,6 +132,10 @@ create table if not exists user_squad (
   primary key (user_id, gw, player_id)
 );
 
+-- DEPRECATED (kept for back-compat + as the 001 migration's backfill source).
+-- Superseded by the LMS-rework tables below (lms_competitions / lms_entries /
+-- lms_entry_picks). New writes go to lms_entry_picks; the pipeline auto-resolve
+-- step settles lms_entry_picks (NOT this table). See db/migrations/001_lms_rework.sql.
 create table if not exists lms_picks (
   user_id    integer references users(id) on delete cascade,
   round_gw   int not null,
@@ -141,6 +145,57 @@ create table if not exists lms_picks (
   created_at timestamptz default now(),
   primary key (user_id, round_gw)
 );
+
+-- ---- LMS rework (mirrors db/migrations/001_lms_rework.sql; structure only) ----
+-- Competitions -> Entries -> per-entry picks. Each entry is an independent run
+-- (own used-teams, status, reserve strategy, confidence floor). team_id FKs are
+-- to teams(fpl_id). Backfill of legacy lms_picks lives ONLY in the migration.
+
+create table if not exists lms_competitions (
+  id         serial primary key,
+  user_id    integer not null references users(id) on delete cascade,
+  name       text not null,
+  start_gw   int not null default 1,
+  notes      text,
+  created_at timestamptz default now()
+);
+
+create table if not exists lms_competition_deadlines (
+  competition_id int not null references lms_competitions(id) on delete cascade,
+  gw             int not null,
+  deadline       timestamptz,               -- NULL = use computed default (day before first fixture)
+  primary key (competition_id, gw)
+);
+
+create table if not exists lms_entries (
+  id               serial primary key,
+  competition_id   int not null references lms_competitions(id) on delete cascade,
+  label            text not null,
+  status           text not null default 'alive',    -- 'alive' | 'out'
+  eliminated_gw    int,
+  reserve_strategy text not null default 'smart',     -- 'safest' | 'manual' | 'smart'
+  confidence_floor numeric not null default 0.65
+);
+
+create table if not exists lms_entry_picks (
+  id          serial primary key,
+  entry_id    int not null references lms_entries(id) on delete cascade,
+  gw          int not null,
+  team_id     int not null references teams(fpl_id),
+  result      text not null default 'pending',        -- 'pending' | 'survived' | 'eliminated'
+  is_backfill boolean not null default false,
+  unique (entry_id, gw),
+  unique (entry_id, team_id)                          -- single-use team per entry per season
+);
+
+create table if not exists lms_entry_reserves (
+  entry_id int not null references lms_entries(id) on delete cascade,
+  team_id  int not null references teams(fpl_id),
+  primary key (entry_id, team_id)
+);
+
+create index if not exists idx_lms_entry_picks_entry_id  on lms_entry_picks (entry_id);
+create index if not exists idx_lms_entries_competition_id on lms_entries (competition_id);
 
 create table if not exists recommendations_log (
   id         bigint generated always as identity primary key,

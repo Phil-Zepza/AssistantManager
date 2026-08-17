@@ -373,6 +373,60 @@ def player_ep_row(
     }
 
 
+# ============================ LMS auto-resolve ============================
+# Pure settlement logic for LMS entry picks. Strict rules: a WIN survives; a
+# DRAW or LOSS eliminates. Kept DB-free so it is unit-testable offline; the
+# pipeline step (run.py step5) feeds it DB rows and applies the returned updates.
+
+
+def resolve_lms_result(is_home: bool, home_score: int, away_score: int) -> str:
+    """Outcome for a backed team in a finished fixture.
+
+    win -> 'survived'; draw or loss -> 'eliminated' (strict: a draw is OUT).
+    """
+    team_score = home_score if is_home else away_score
+    opp_score = away_score if is_home else home_score
+    return "survived" if team_score > opp_score else "eliminated"
+
+
+def resolve_lms_picks(pending_picks, fixtures_by_gw):
+    """Settle a batch of pending LMS entry picks (pure).
+
+    Args:
+      pending_picks: list of {"id", "entry_id", "gw", "team_id"} (result='pending').
+      fixtures_by_gw: {gw: {"all_finished": bool,
+                            "by_team": {team_id: {"is_home", "home_score", "away_score"}}}}.
+
+    Returns (pick_updates, entry_outs):
+      pick_updates: [{"id", "result"}] for picks whose round is FULLY finished and
+                    whose team actually played (win->survived, else eliminated).
+      entry_outs:   {entry_id: eliminated_gw} = earliest gw each entry was eliminated.
+
+    Only fully-finished rounds are settled; a pick whose team did not play that
+    round (blank GW) is left pending. Idempotent by construction — callers pass
+    ONLY currently-pending picks.
+    """
+    pick_updates = []
+    entry_outs: dict[int, int] = {}
+    for p in pending_picks:
+        gw = p["gw"]
+        fx = fixtures_by_gw.get(gw)
+        if not fx or not fx.get("all_finished"):
+            continue  # round not fully finished yet
+        team_fx = fx.get("by_team", {}).get(p["team_id"])
+        if not team_fx:
+            continue  # blank GW / team didn't play -> leave pending
+        result = resolve_lms_result(
+            team_fx["is_home"], team_fx["home_score"], team_fx["away_score"]
+        )
+        pick_updates.append({"id": p["id"], "result": result})
+        if result == "eliminated":
+            prev = entry_outs.get(p["entry_id"])
+            if prev is None or gw < prev:
+                entry_outs[p["entry_id"]] = gw
+    return pick_updates, entry_outs
+
+
 # ============================ offline self-check ============================
 if __name__ == "__main__":
     # Synthetic data — no network. Proves probs sum to ~1 and EP is non-negative.
@@ -444,6 +498,33 @@ if __name__ == "__main__":
     assert eps[104] < 1.0, f"fringe cameo should project near zero, got {eps[104]}"
     assert eps[101] > eps[104], "nailed premium must outrank a fringe cameo"
 
+    # --- LMS auto-resolve (offline, stubbed finished fixtures) ---
+    assert resolve_lms_result(True, 2, 0) == "survived"  # home win
+    assert resolve_lms_result(False, 0, 1) == "survived"  # away win
+    assert resolve_lms_result(True, 1, 1) == "eliminated"  # draw = OUT
+    assert resolve_lms_result(False, 2, 0) == "eliminated"  # away loss
+    stub_picks = [
+        {"id": 1, "entry_id": 7, "gw": 1, "team_id": 100},  # home win  -> survived
+        {"id": 2, "entry_id": 8, "gw": 1, "team_id": 200},  # away draw -> eliminated
+        {"id": 3, "entry_id": 9, "gw": 2, "team_id": 100},  # gw2 not finished -> skip
+        {"id": 4, "entry_id": 7, "gw": 1, "team_id": 999},  # blank GW (no fixture) -> skip
+    ]
+    stub_fixtures = {
+        1: {
+            "all_finished": True,
+            "by_team": {
+                100: {"is_home": True, "home_score": 2, "away_score": 0},
+                200: {"is_home": False, "home_score": 1, "away_score": 1},
+            },
+        },
+        2: {"all_finished": False, "by_team": {}},
+    }
+    lms_updates, lms_outs = resolve_lms_picks(stub_picks, stub_fixtures)
+    upd_by_id = {u["id"]: u["result"] for u in lms_updates}
+    assert upd_by_id == {1: "survived", 2: "eliminated"}, f"bad LMS updates: {lms_updates}"
+    assert 3 not in upd_by_id and 4 not in upd_by_id, "unfinished/blank picks must skip"
+    assert lms_outs == {8: 1}, f"entry 8 should flip out at gw1: {lms_outs}"
+
     print("OK  models.py self-check passed")
     print(f"  seeded Elo:        {{1:{elo[1]:.0f}, 2:{elo[2]:.0f}, 3:{elo[3]:.0f}}}")
     print(f"  Elo after 0-3:     {{1:{elo2[1]:.0f}, 2:{elo2[2]:.0f}}}")
@@ -455,3 +536,4 @@ if __name__ == "__main__":
           f"INJ#103={eps[103]:.2f}  FRINGE#104={eps[104]:.2f}")
     print(f"  guardrail:         soft cap {EP_SOFT_CAP}, sane max {EP_SANE_MAX} "
           f"(all {len(players)} test players within bounds)")
+    print("  LMS resolve:       pick1->survived, pick2->eliminated, entry8 OUT@gw1")

@@ -9,7 +9,7 @@ import { getCurrentGw } from "@/lib/gameweek";
 import { getEntryPicks } from "@/lib/fpl";
 import { ONBOARDING_SKIP_COOKIE } from "@/lib/onboarding";
 import { validateSquad, type SquadMember } from "@/lib/squad";
-import type { Position, SquadSelection } from "@/lib/types";
+import type { LmsEntryStatus, Position, SquadSelection } from "@/lib/types";
 
 // Send a magic-link email via the Resend provider. Returns a status object so
 // the login page can show "check your email" without a full-page redirect.
@@ -286,6 +286,391 @@ export async function saveLmsPick(input: {
     `insert into lms_picks (user_id, round_gw, team_id, result, survived)
        values ($1, $2, $3, 'pending', null)`,
     [userId, roundGw, teamId],
+  );
+  revalidatePath("/lms");
+  return { ok: true };
+}
+
+// ================= LMS rework: Competitions -> Entries =================
+// All writes here go to OUR Postgres only (we own the LMS game). userId ALWAYS
+// comes from the server session; every write verifies the target competition/
+// entry is owned by that user before mutating. submitPick is the single lock
+// write — forward-plan overrides are pure client-side recompute (planner pins),
+// never persisted, so the pipeline auto-resolve step can never mistake a plan
+// preference for a locked submission.
+
+const RESERVE_STRATEGIES = ["safest", "manual", "smart"] as const;
+function isReserveStrategy(
+  s: unknown,
+): s is (typeof RESERVE_STRATEGIES)[number] {
+  return (
+    typeof s === "string" &&
+    (RESERVE_STRATEGIES as readonly string[]).includes(s)
+  );
+}
+
+// Ownership guard: load an entry only if its competition belongs to userId.
+async function loadOwnedEntry(
+  userId: number,
+  entryId: number,
+): Promise<{ id: number; competition_id: number; status: LmsEntryStatus } | null> {
+  const rows = await q<{
+    id: number;
+    competition_id: number;
+    status: LmsEntryStatus;
+  }>(
+    `select e.id, e.competition_id, e.status
+       from lms_entries e
+       join lms_competitions c on c.id = e.competition_id
+      where e.id = $1 and c.user_id = $2`,
+    [entryId, userId],
+  );
+  return rows[0] ?? null;
+}
+
+async function competitionOwned(
+  userId: number,
+  competitionId: number,
+): Promise<boolean> {
+  const rows = await q<{ id: number }>(
+    `select id from lms_competitions where id = $1 and user_id = $2`,
+    [competitionId, userId],
+  );
+  return rows.length > 0;
+}
+
+// Create a competition with one or more entries. Optional per-entry backfillPicks
+// record rounds the user already played before joining (is_backfill=true, result
+// 'pending' — the pipeline auto-resolve settles them once their fixtures finish).
+export async function createCompetition(input: {
+  name: string;
+  startGw: number;
+  entries: { label: string; backfillPicks?: { gw: number; teamId: number }[] }[];
+}): Promise<{ ok: boolean; error?: string; competitionId?: number }> {
+  const session = await auth();
+  const userId = session?.user?.id;
+  if (!userId) throw new Error("Not authenticated");
+
+  const name = (input.name ?? "").trim();
+  if (!name) return { ok: false, error: "Enter a competition name." };
+
+  const startGw = Number(input.startGw);
+  if (!Number.isInteger(startGw) || startGw <= 0) {
+    return { ok: false, error: "Invalid start gameweek." };
+  }
+
+  const entries = input.entries ?? [];
+  if (entries.length === 0) {
+    return { ok: false, error: "Add at least one entry." };
+  }
+
+  // Validate entries + backfill picks up front (fail before writing anything).
+  const cleanEntries: { label: string; picks: { gw: number; teamId: number }[] }[] =
+    [];
+  const allTeamIds = new Set<number>();
+  for (const e of entries) {
+    const label = (e.label ?? "").trim();
+    if (!label) return { ok: false, error: "Every entry needs a label." };
+
+    const picks = e.backfillPicks ?? [];
+    const seenGw = new Set<number>();
+    const seenTeam = new Set<number>();
+    const clean: { gw: number; teamId: number }[] = [];
+    for (const p of picks) {
+      const gw = Number(p.gw);
+      const teamId = Number(p.teamId);
+      if (!Number.isInteger(gw) || gw <= 0 || !Number.isInteger(teamId) || teamId <= 0) {
+        return { ok: false, error: "Invalid backfill pick." };
+      }
+      if (seenGw.has(gw)) {
+        return { ok: false, error: `Two picks for GW${gw} in "${label}".` };
+      }
+      if (seenTeam.has(teamId)) {
+        return { ok: false, error: `Team used twice in "${label}".` };
+      }
+      seenGw.add(gw);
+      seenTeam.add(teamId);
+      allTeamIds.add(teamId);
+      clean.push({ gw, teamId });
+    }
+    cleanEntries.push({ label, picks: clean });
+  }
+
+  // Every backfilled team must exist (FK would otherwise abort the tx).
+  if (allTeamIds.size > 0) {
+    const existing = await q<{ fpl_id: number }>(
+      `select fpl_id from teams where fpl_id = any($1::int[])`,
+      [[...allTeamIds]],
+    );
+    if (existing.length !== allTeamIds.size) {
+      return { ok: false, error: "One or more backfill teams are unknown." };
+    }
+  }
+
+  let competitionId = 0;
+  await tx(async (client) => {
+    const compRes = await client.query(
+      `insert into lms_competitions (user_id, name, start_gw)
+         values ($1, $2, $3) returning id`,
+      [userId, name, startGw],
+    );
+    competitionId = compRes.rows[0].id as number;
+
+    for (const e of cleanEntries) {
+      const entryRes = await client.query(
+        `insert into lms_entries (competition_id, label) values ($1, $2) returning id`,
+        [competitionId, e.label],
+      );
+      const entryId = entryRes.rows[0].id as number;
+      for (const p of e.picks) {
+        await client.query(
+          `insert into lms_entry_picks (entry_id, gw, team_id, result, is_backfill)
+             values ($1, $2, $3, 'pending', true)`,
+          [entryId, p.gw, p.teamId],
+        );
+      }
+    }
+  });
+
+  revalidatePath("/lms");
+  return { ok: true, competitionId };
+}
+
+// Add a further independent entry to an existing (owned) competition.
+export async function addEntry(
+  competitionId: number,
+  label: string,
+  strategy?: string,
+): Promise<{ ok: boolean; error?: string; entryId?: number }> {
+  const session = await auth();
+  const userId = session?.user?.id;
+  if (!userId) throw new Error("Not authenticated");
+
+  const compId = Number(competitionId);
+  if (!Number.isInteger(compId) || compId <= 0) {
+    return { ok: false, error: "Invalid competition." };
+  }
+  const cleanLabel = (label ?? "").trim();
+  if (!cleanLabel) return { ok: false, error: "Enter an entry label." };
+  const mode = strategy == null ? "smart" : strategy;
+  if (!isReserveStrategy(mode)) {
+    return { ok: false, error: "Invalid reserve strategy." };
+  }
+  if (!(await competitionOwned(userId, compId))) {
+    return { ok: false, error: "Competition not found." };
+  }
+
+  const res = await q<{ id: number }>(
+    `insert into lms_entries (competition_id, label, reserve_strategy)
+       values ($1, $2, $3) returning id`,
+    [compId, cleanLabel, mode],
+  );
+  revalidatePath("/lms");
+  return { ok: true, entryId: res[0].id };
+}
+
+// Record + lock the current round's pick for an entry. THE single lock write.
+// Mirrors saveLmsPick's rules, scoped per entry: the round must be a real,
+// LMS-eligible, unfinished GW; the team must play that round; single-use per
+// entry (enforced by unique(entry_id, team_id)); one pick per round (unique
+// (entry_id, gw)). Never touches FPL.
+export async function submitPick(
+  entryId: number,
+  gw: number,
+  teamId: number,
+): Promise<{ ok: boolean; error?: string }> {
+  const session = await auth();
+  const userId = session?.user?.id;
+  if (!userId) throw new Error("Not authenticated");
+
+  const eId = Number(entryId);
+  const roundGw = Number(gw);
+  const team = Number(teamId);
+  if (!Number.isInteger(eId) || eId <= 0) return { ok: false, error: "Invalid entry." };
+  if (!Number.isInteger(roundGw) || roundGw <= 0) {
+    return { ok: false, error: "Invalid round." };
+  }
+  if (!Number.isInteger(team) || team <= 0) return { ok: false, error: "Invalid team." };
+
+  const entry = await loadOwnedEntry(userId, eId);
+  if (!entry) return { ok: false, error: "Entry not found." };
+  if (entry.status === "out") {
+    return { ok: false, error: "This entry is already out." };
+  }
+
+  // Round must exist, be LMS-eligible and not finished.
+  const gwRows = await q<{ lms_eligible: boolean; finished: boolean }>(
+    `select lms_eligible, finished from gameweeks where gw = $1`,
+    [roundGw],
+  );
+  if (gwRows.length === 0) return { ok: false, error: "Unknown round." };
+  if (!gwRows[0].lms_eligible) {
+    return { ok: false, error: "Round has fewer than 7 fixtures." };
+  }
+  if (gwRows[0].finished) {
+    return { ok: false, error: "That round is already finished." };
+  }
+
+  // The backed team must play in this round.
+  const playsRows = await q<{ n: string }>(
+    `select count(*)::text as n from fixtures
+       where gw = $1 and (home_team = $2 or away_team = $2)`,
+    [roundGw, team],
+  );
+  if (!playsRows[0] || Number(playsRows[0].n) === 0) {
+    return { ok: false, error: "That team has no fixture this round." };
+  }
+
+  // Single-use per entry: reject a team already spent by this entry.
+  const usedRows = await q<{ gw: number }>(
+    `select gw from lms_entry_picks where entry_id = $1 and team_id = $2`,
+    [eId, team],
+  );
+  if (usedRows.length > 0) {
+    return { ok: false, error: "That team is already used by this entry." };
+  }
+
+  // One pick per round: reject if this round is already locked for the entry.
+  const existing = await q<{ id: number }>(
+    `select id from lms_entry_picks where entry_id = $1 and gw = $2`,
+    [eId, roundGw],
+  );
+  if (existing.length > 0) {
+    return { ok: false, error: "This round's pick is already locked." };
+  }
+
+  await q(
+    `insert into lms_entry_picks (entry_id, gw, team_id, result, is_backfill)
+       values ($1, $2, $3, 'pending', false)`,
+    [eId, roundGw, team],
+  );
+  revalidatePath("/lms");
+  return { ok: true };
+}
+
+// Set an entry's reserve strategy + confidence floor.
+export async function setStrategy(
+  entryId: number,
+  mode: string,
+  floor: number,
+): Promise<{ ok: boolean; error?: string }> {
+  const session = await auth();
+  const userId = session?.user?.id;
+  if (!userId) throw new Error("Not authenticated");
+
+  const eId = Number(entryId);
+  if (!Number.isInteger(eId) || eId <= 0) return { ok: false, error: "Invalid entry." };
+  if (!isReserveStrategy(mode)) {
+    return { ok: false, error: "Invalid reserve strategy." };
+  }
+  const f = Number(floor);
+  if (!Number.isFinite(f) || f < 0 || f > 1) {
+    return { ok: false, error: "Confidence floor must be between 0 and 1." };
+  }
+  if (!(await loadOwnedEntry(userId, eId))) {
+    return { ok: false, error: "Entry not found." };
+  }
+
+  await q(
+    `update lms_entries set reserve_strategy = $1, confidence_floor = $2 where id = $3`,
+    [mode, f, eId],
+  );
+  revalidatePath("/lms");
+  return { ok: true };
+}
+
+// Replace an entry's reserve list. Reserves cannot include already-used teams.
+export async function setReserves(
+  entryId: number,
+  teamIds: number[],
+): Promise<{ ok: boolean; error?: string }> {
+  const session = await auth();
+  const userId = session?.user?.id;
+  if (!userId) throw new Error("Not authenticated");
+
+  const eId = Number(entryId);
+  if (!Number.isInteger(eId) || eId <= 0) return { ok: false, error: "Invalid entry." };
+  if (!(await loadOwnedEntry(userId, eId))) {
+    return { ok: false, error: "Entry not found." };
+  }
+
+  const ids = [...new Set((teamIds ?? []).map((t) => Number(t)))];
+  if (ids.some((t) => !Number.isInteger(t) || t <= 0)) {
+    return { ok: false, error: "Invalid team in reserves." };
+  }
+
+  if (ids.length > 0) {
+    // Teams must exist and not already be spent by this entry.
+    const [existing, used] = await Promise.all([
+      q<{ fpl_id: number }>(
+        `select fpl_id from teams where fpl_id = any($1::int[])`,
+        [ids],
+      ),
+      q<{ team_id: number }>(
+        `select team_id from lms_entry_picks where entry_id = $1 and team_id = any($2::int[])`,
+        [eId, ids],
+      ),
+    ]);
+    if (existing.length !== ids.length) {
+      return { ok: false, error: "One or more reserve teams are unknown." };
+    }
+    if (used.length > 0) {
+      return { ok: false, error: "Cannot reserve a team already used by this entry." };
+    }
+  }
+
+  await tx(async (client) => {
+    await client.query(`delete from lms_entry_reserves where entry_id = $1`, [eId]);
+    for (const t of ids) {
+      await client.query(
+        `insert into lms_entry_reserves (entry_id, team_id) values ($1, $2)`,
+        [eId, t],
+      );
+    }
+  });
+  revalidatePath("/lms");
+  return { ok: true };
+}
+
+// Set (or clear) a round's deadline override for a competition. Passing null
+// stores NULL, which the read layer treats as "use the computed default"
+// (day before the round's first kickoff).
+export async function setRoundDeadline(
+  competitionId: number,
+  gw: number,
+  deadline: string | null,
+): Promise<{ ok: boolean; error?: string }> {
+  const session = await auth();
+  const userId = session?.user?.id;
+  if (!userId) throw new Error("Not authenticated");
+
+  const compId = Number(competitionId);
+  const roundGw = Number(gw);
+  if (!Number.isInteger(compId) || compId <= 0) {
+    return { ok: false, error: "Invalid competition." };
+  }
+  if (!Number.isInteger(roundGw) || roundGw <= 0) {
+    return { ok: false, error: "Invalid round." };
+  }
+
+  let value: string | null = null;
+  if (deadline != null) {
+    const ts = new Date(deadline);
+    if (Number.isNaN(ts.getTime())) {
+      return { ok: false, error: "Invalid deadline." };
+    }
+    value = ts.toISOString();
+  }
+
+  if (!(await competitionOwned(userId, compId))) {
+    return { ok: false, error: "Competition not found." };
+  }
+
+  await q(
+    `insert into lms_competition_deadlines (competition_id, gw, deadline)
+       values ($1, $2, $3)
+       on conflict (competition_id, gw) do update set deadline = excluded.deadline`,
+    [compId, roundGw, value],
   );
   revalidatePath("/lms");
   return { ok: true };

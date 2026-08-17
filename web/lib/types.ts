@@ -245,6 +245,130 @@ export interface LmsForwardRound {
 
 export type LmsForwardPlan = LmsForwardRound[];
 
+// ---- LMS rework: Competitions -> Entries (db/migrations/001_lms_rework.sql) ----
+
+export type LmsEntryStatus = "alive" | "out";
+export type LmsReserveStrategy = "safest" | "manual" | "smart";
+export type LmsPickResult = "pending" | "survived" | "eliminated";
+
+// Row shapes (mirror the migration/schema tables EXACTLY).
+export interface LmsCompetition {
+  id: number;
+  user_id: number;
+  name: string;
+  start_gw: number;
+  notes: string | null;
+  created_at: string;
+}
+
+export interface LmsCompetitionDeadline {
+  competition_id: number;
+  gw: number;
+  deadline: string | null; // NULL = use computed default
+}
+
+export interface LmsEntryRow {
+  id: number;
+  competition_id: number;
+  label: string;
+  status: LmsEntryStatus;
+  eliminated_gw: number | null;
+  reserve_strategy: LmsReserveStrategy;
+  confidence_floor: number; // numeric — MUST be Number()-coerced in the query layer
+}
+
+export interface LmsEntryPickRow {
+  id: number;
+  entry_id: number;
+  gw: number;
+  team_id: number;
+  result: LmsPickResult;
+  is_backfill: boolean;
+}
+
+export interface LmsEntryReserve {
+  entry_id: number;
+  team_id: number;
+}
+
+// View models (composed reads for the UI).
+
+// One entry's at-a-glance state, for the competitions list.
+export interface LmsEntrySummary {
+  id: number;
+  label: string;
+  status: LmsEntryStatus;
+  eliminatedGw: number | null;
+  strategy: LmsReserveStrategy;
+  picksCount: number;
+}
+
+// A competition with per-entry summaries + the next upcoming deadline.
+export interface LmsCompetitionSummary {
+  id: number;
+  name: string;
+  startGw: number;
+  notes: string | null;
+  entries: LmsEntrySummary[];
+  aliveCount: number;
+  outCount: number;
+  nextDeadline: { gw: number; deadline: string | null } | null;
+}
+
+// Full competition detail (competition + its entries as summaries).
+export interface LmsCompetitionDetail {
+  id: number;
+  userId: number;
+  name: string;
+  startGw: number;
+  notes: string | null;
+  entries: LmsEntrySummary[];
+}
+
+// One submitted pick joined with its team for display.
+export interface LmsEntryPickView {
+  gw: number;
+  team: Team | null;
+  result: LmsPickResult;
+  isBackfill: boolean;
+}
+
+// One team with its single-use availability for this entry.
+export interface LmsTeamOption {
+  team: Team;
+  used: boolean; // spent in a submitted round by this entry
+  reserved: boolean; // in this entry's reserve list
+  available: boolean; // not used and not reserved
+}
+
+// Full entry detail for the entry canvas.
+export interface LmsEntryDetail {
+  id: number;
+  competitionId: number;
+  label: string;
+  status: LmsEntryStatus;
+  eliminatedGw: number | null;
+  strategy: LmsReserveStrategy;
+  confidenceFloor: number;
+  picks: LmsEntryPickView[];
+  usedTeamIds: number[];
+  reservedTeamIds: number[];
+  teams: LmsTeamOption[];
+}
+
+// A gameweek fixture + model probs shaped for a home/draw/away ProbBar.
+export interface LmsGameweekFixture {
+  fixtureId: number;
+  gw: number;
+  homeTeam: Team | null;
+  awayTeam: Team | null;
+  kickoff: string | null;
+  finished: boolean;
+  pHome: number | null;
+  pDraw: number | null;
+  pAway: number | null;
+}
+
 // ---- History ----
 
 // Canonical outcome shapes for recommendations_log.outcome jsonb.
