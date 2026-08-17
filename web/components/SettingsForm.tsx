@@ -48,33 +48,33 @@ export default function SettingsForm({ user }: { user: User }) {
     <div className="space-y-6">
       <form
         onSubmit={save}
-        className="space-y-4 rounded-xl border border-gray-200 bg-white p-5 shadow-sm"
+        className="space-y-4 rounded-xl border border-subtle bg-surface p-5 shadow-sm"
       >
         <div>
-          <label className="mb-1 block text-sm font-medium text-gray-700">
+          <label className="mb-1 block text-sm font-medium text-secondary">
             Email
           </label>
           <input
             value={user.email ?? ""}
             disabled
-            className="w-full rounded-lg border border-gray-200 bg-gray-100 px-3 py-2 text-base text-gray-500"
+            className="w-full rounded-lg border border-subtle bg-surface-2 px-3 py-2 text-base text-secondary"
           />
         </div>
 
         <div>
-          <label className="mb-1 block text-sm font-medium text-gray-700">
+          <label className="mb-1 block text-sm font-medium text-secondary">
             Display name
           </label>
           <input
             value={displayName}
             onChange={(e) => setDisplayName(e.target.value)}
             placeholder="Your name"
-            className="w-full rounded-lg border border-gray-300 px-3 py-2 text-base focus:border-brand focus:outline-none focus:ring-1 focus:ring-brand"
+            className="w-full rounded-lg border border-strong px-3 py-2 text-base focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent"
           />
         </div>
 
         <div>
-          <label className="mb-1 block text-sm font-medium text-gray-700">
+          <label className="mb-1 block text-sm font-medium text-secondary">
             FPL team ID
           </label>
           <input
@@ -82,21 +82,21 @@ export default function SettingsForm({ user }: { user: User }) {
             value={fplId}
             onChange={(e) => setFplId(e.target.value)}
             placeholder="e.g. 1234567"
-            className="w-full rounded-lg border border-gray-300 px-3 py-2 text-base focus:border-brand focus:outline-none focus:ring-1 focus:ring-brand"
+            className="w-full rounded-lg border border-strong px-3 py-2 text-base focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent"
           />
         </div>
 
         <button
           type="submit"
           disabled={saving}
-          className="w-full rounded-lg bg-brand px-4 py-2.5 font-semibold text-white disabled:opacity-50"
+          className="w-full rounded-lg bg-accent px-4 py-2.5 font-semibold text-on-accent disabled:opacity-50"
         >
           {saving ? "Saving…" : "Save changes"}
         </button>
 
         {msg && (
           <p
-            className={`text-sm ${msg.ok ? "text-green-600" : "text-red-600"}`}
+            className={`text-sm ${msg.ok ? "text-success" : "text-danger"}`}
           >
             {msg.text}
           </p>
@@ -106,7 +106,7 @@ export default function SettingsForm({ user }: { user: User }) {
       <form action={signOutAction}>
         <button
           type="submit"
-          className="w-full rounded-lg border border-gray-300 bg-white px-4 py-2.5 font-semibold text-gray-700 hover:bg-gray-50"
+          className="w-full rounded-lg border border-strong bg-surface px-4 py-2.5 font-semibold text-secondary hover:bg-surface-2"
         >
           Sign out
         </button>

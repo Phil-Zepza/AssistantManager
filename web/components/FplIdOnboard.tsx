@@ -33,9 +33,9 @@ export default function FplIdOnboard({ userId: _userId }: { userId: number }) {
   }
 
   return (
-    <div className="rounded-xl border border-brand/20 bg-white p-5 shadow-sm">
-      <h2 className="text-lg font-semibold text-brand">Connect your FPL team</h2>
-      <p className="mt-1 text-sm text-gray-600">
+    <div className="rounded-xl border border-subtle bg-surface p-5 shadow-sm">
+      <h2 className="text-lg font-semibold text-accent">Connect your FPL team</h2>
+      <p className="mt-1 text-sm text-secondary">
         Enter your FPL team (entry) ID so we can load your squad and make
         recommendations. You can find it in the URL of your FPL points page:
         <br />
@@ -49,17 +49,17 @@ export default function FplIdOnboard({ userId: _userId }: { userId: number }) {
           value={value}
           onChange={(e) => setValue(e.target.value)}
           placeholder="e.g. 1234567"
-          className="w-full rounded-lg border border-gray-300 px-3 py-2 text-base focus:border-brand focus:outline-none focus:ring-1 focus:ring-brand"
+          className="w-full rounded-lg border border-strong px-3 py-2 text-base focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent"
         />
         <button
           type="submit"
           disabled={saving}
-          className="whitespace-nowrap rounded-lg bg-brand px-4 py-2 font-semibold text-white disabled:opacity-50"
+          className="whitespace-nowrap rounded-lg bg-accent px-4 py-2 font-semibold text-on-accent disabled:opacity-50"
         >
           {saving ? "Saving…" : "Save"}
         </button>
       </form>
-      {error && <p className="mt-2 text-sm text-red-600">{error}</p>}
+      {error && <p className="mt-2 text-sm text-danger">{error}</p>}
     </div>
   );
 }

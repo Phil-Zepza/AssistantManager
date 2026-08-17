@@ -50,7 +50,7 @@ export default async function SquadEditPage() {
             hint="The player pool and projections appear once the pipeline has loaded this season's players, teams and fixtures."
           />
           <div className="mt-4">
-            <Link href="/" className="text-sm font-medium text-brand hover:underline">
+            <Link href="/" className="text-sm font-medium text-accent hover:underline">
               ← Back to dashboard
             </Link>
           </div>

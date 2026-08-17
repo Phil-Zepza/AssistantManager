@@ -91,8 +91,8 @@ export default async function HistoryPage() {
 function Stat({ label, value }: { label: string; value: string }) {
   return (
     <Card className="text-center">
-      <div className="text-2xl font-bold text-brand">{value}</div>
-      <div className="text-xs text-gray-500">{label}</div>
+      <div className="text-2xl font-bold text-accent">{value}</div>
+      <div className="text-xs text-secondary">{label}</div>
     </Card>
   );
 }
@@ -106,12 +106,12 @@ function RecRow({ rec }: { rec: RecommendationLog }) {
           <Badge tone="purple">
             {KIND_LABEL[rec.kind] ?? rec.kind}
           </Badge>
-          <span className="text-xs text-gray-400">GW {rec.gw}</span>
+          <span className="text-xs text-muted">GW {rec.gw}</span>
         </div>
-        <p className="mt-1 truncate text-sm font-medium text-gray-800">
+        <p className="mt-1 truncate text-sm font-medium text-primary">
           {summarisePayload(rec.payload)}
         </p>
-        <p className="text-xs text-gray-400">{formatDate(rec.created_at)}</p>
+        <p className="text-xs text-muted">{formatDate(rec.created_at)}</p>
       </div>
       <div className="ml-3 shrink-0">
         {rec.outcome == null ? (
