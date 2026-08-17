@@ -3,8 +3,17 @@ import type {
   Fixture,
   Gameweek,
   HistoryEntry,
+  LmsCompetitionDetail,
+  LmsCompetitionSummary,
+  LmsEntryDetail,
+  LmsEntryPickView,
+  LmsEntryStatus,
   LmsFixtureOption,
+  LmsGameweekFixture,
   LmsPick,
+  LmsPickResult,
+  LmsReserveStrategy,
+  LmsTeamOption,
   ModelFixtureProbs,
   PickPoolEntry,
   Player,
@@ -15,6 +24,14 @@ import type {
   TransferSuggestion,
   User,
 } from "./types";
+import {
+  computeDefaultDeadline,
+  computeEliteSet,
+  type PlannerEntryState,
+  type PlannerFixtureProb,
+  type PlannerRound,
+  type PlannerTeam,
+} from "./lmsPlanner";
 
 const POSITIONS: Position[] = ["GK", "DEF", "MID", "FWD"];
 
@@ -373,6 +390,384 @@ export function recommendedLmsPick(
   return eligible.reduce((best, o) =>
     (o.pickWinProb ?? -1) > (best.pickWinProb ?? -1) ? o : best,
   );
+}
+
+// ---------- LMS rework: Competitions -> Entries ----------
+
+// teams row -> planner PlannerTeam shape.
+function toPlannerTeam(t: Team): PlannerTeam {
+  return {
+    id: t.fpl_id,
+    shortName: t.short_name,
+    elo: t.elo,
+    strengthAttack: t.strength_attack,
+  };
+}
+
+// All competitions for a user, each with per-entry Alive/Out summaries and the
+// next upcoming (eligible, unfinished) round's resolved deadline (override, else
+// computed default). userId ALWAYS comes from the server session.
+export async function getCompetitions(
+  userId: number,
+): Promise<LmsCompetitionSummary[]> {
+  const rows = await q<{
+    id: number;
+    name: string;
+    start_gw: number;
+    notes: string | null;
+    entry_id: number | null;
+    label: string | null;
+    status: LmsEntryStatus | null;
+    eliminated_gw: number | null;
+    reserve_strategy: LmsReserveStrategy | null;
+    picks_count: string | null;
+  }>(
+    `select c.id, c.name, c.start_gw, c.notes,
+            e.id as entry_id, e.label, e.status, e.eliminated_gw, e.reserve_strategy,
+            (select count(*) from lms_entry_picks p where p.entry_id = e.id) as picks_count
+       from lms_competitions c
+       left join lms_entries e on e.competition_id = c.id
+      where c.user_id = $1
+      order by c.id asc, e.id asc`,
+    [userId],
+  );
+  if (rows.length === 0) return [];
+
+  // Next-deadline inputs: upcoming eligible unfinished rounds + their fixtures +
+  // any per-competition overrides.
+  const compIds = [...new Set(rows.map((r) => r.id))];
+  const upcoming = await q<{ gw: number }>(
+    `select gw from gameweeks
+      where finished = false and lms_eligible = true
+      order by gw asc`,
+  );
+  const upcomingGws = upcoming.map((u) => u.gw);
+  const fixtures =
+    upcomingGws.length > 0
+      ? await q<{ gw: number; kickoff: string | null }>(
+          `select gw, kickoff from fixtures where gw = any($1::int[])`,
+          [upcomingGws],
+        )
+      : [];
+  const overrides = await q<{
+    competition_id: number;
+    gw: number;
+    deadline: string | null;
+  }>(
+    `select competition_id, gw, deadline from lms_competition_deadlines
+      where competition_id = any($1::int[]) and deadline is not null`,
+    [compIds],
+  );
+  const overrideByKey = new Map<string, string>();
+  for (const o of overrides) {
+    if (o.deadline != null) {
+      overrideByKey.set(`${o.competition_id}:${o.gw}`, o.deadline);
+    }
+  }
+
+  const resolveNextDeadline = (
+    compId: number,
+    startGw: number,
+  ): { gw: number; deadline: string | null } | null => {
+    const gw = upcomingGws.find((g) => g >= startGw);
+    if (gw == null) return null;
+    const deadline =
+      overrideByKey.get(`${compId}:${gw}`) ?? computeDefaultDeadline(gw, fixtures);
+    return { gw, deadline };
+  };
+
+  const byId = new Map<number, LmsCompetitionSummary>();
+  for (const r of rows) {
+    let comp = byId.get(r.id);
+    if (!comp) {
+      comp = {
+        id: r.id,
+        name: r.name,
+        startGw: r.start_gw,
+        notes: r.notes,
+        entries: [],
+        aliveCount: 0,
+        outCount: 0,
+        nextDeadline: resolveNextDeadline(r.id, r.start_gw),
+      };
+      byId.set(r.id, comp);
+    }
+    if (r.entry_id != null) {
+      const status: LmsEntryStatus = r.status ?? "alive";
+      comp.entries.push({
+        id: r.entry_id,
+        label: r.label ?? "",
+        status,
+        eliminatedGw: r.eliminated_gw,
+        strategy: r.reserve_strategy ?? "smart",
+        picksCount: Number(r.picks_count ?? 0),
+      });
+      if (status === "out") comp.outCount += 1;
+      else comp.aliveCount += 1;
+    }
+  }
+  return [...byId.values()];
+}
+
+// A single competition + its entries. Scoped by userId (returns null if the
+// competition is not owned by this user).
+export async function getCompetition(
+  id: number,
+  userId: number,
+): Promise<LmsCompetitionDetail | null> {
+  const compRows = await q<{
+    id: number;
+    user_id: number;
+    name: string;
+    start_gw: number;
+    notes: string | null;
+  }>(
+    `select id, user_id, name, start_gw, notes
+       from lms_competitions where id = $1 and user_id = $2`,
+    [id, userId],
+  );
+  const c = compRows[0];
+  if (!c) return null;
+
+  const entries = await q<{
+    id: number;
+    label: string;
+    status: LmsEntryStatus;
+    eliminated_gw: number | null;
+    reserve_strategy: LmsReserveStrategy;
+    picks_count: string;
+  }>(
+    `select e.id, e.label, e.status, e.eliminated_gw, e.reserve_strategy,
+            (select count(*) from lms_entry_picks p where p.entry_id = e.id) as picks_count
+       from lms_entries e where e.competition_id = $1 order by e.id asc`,
+    [id],
+  );
+
+  return {
+    id: c.id,
+    userId: c.user_id,
+    name: c.name,
+    startGw: c.start_gw,
+    notes: c.notes,
+    entries: entries.map((e) => ({
+      id: e.id,
+      label: e.label,
+      status: e.status,
+      eliminatedGw: e.eliminated_gw,
+      strategy: e.reserve_strategy,
+      picksCount: Number(e.picks_count),
+    })),
+  };
+}
+
+// Full entry detail: submitted picks, used teams, reserves, available teams,
+// strategy and floor. Scoped through competition ownership (null if not owned).
+export async function getEntry(
+  id: number,
+  userId: number,
+): Promise<LmsEntryDetail | null> {
+  const entryRows = await q<{
+    id: number;
+    competition_id: number;
+    label: string;
+    status: LmsEntryStatus;
+    eliminated_gw: number | null;
+    reserve_strategy: LmsReserveStrategy;
+    confidence_floor: string; // numeric — coerce with Number()
+  }>(
+    `select e.id, e.competition_id, e.label, e.status, e.eliminated_gw,
+            e.reserve_strategy, e.confidence_floor
+       from lms_entries e
+       join lms_competitions c on c.id = e.competition_id
+      where e.id = $1 and c.user_id = $2`,
+    [id, userId],
+  );
+  const e = entryRows[0];
+  if (!e) return null;
+
+  const [pickRows, reserveRows, teams] = await Promise.all([
+    q<{
+      gw: number;
+      team_id: number;
+      result: LmsPickResult;
+      is_backfill: boolean;
+      team: Team | null;
+    }>(
+      `select p.gw, p.team_id, p.result, p.is_backfill, to_jsonb(t.*) as team
+         from lms_entry_picks p
+         left join teams t on t.fpl_id = p.team_id
+        where p.entry_id = $1 order by p.gw asc`,
+      [id],
+    ),
+    q<{ team_id: number }>(
+      `select team_id from lms_entry_reserves where entry_id = $1`,
+      [id],
+    ),
+    getAllTeams(),
+  ]);
+
+  const usedTeamIds = pickRows.map((p) => p.team_id);
+  const reservedTeamIds = reserveRows.map((r) => r.team_id);
+  const usedSet = new Set(usedTeamIds);
+  const reservedSet = new Set(reservedTeamIds);
+
+  const picks: LmsEntryPickView[] = pickRows.map((p) => ({
+    gw: p.gw,
+    team: p.team,
+    result: p.result,
+    isBackfill: p.is_backfill,
+  }));
+
+  const teamOptions: LmsTeamOption[] = teams.map((t) => {
+    const used = usedSet.has(t.fpl_id);
+    const reserved = reservedSet.has(t.fpl_id);
+    return { team: t, used, reserved, available: !used && !reserved };
+  });
+
+  return {
+    id: e.id,
+    competitionId: e.competition_id,
+    label: e.label,
+    status: e.status,
+    eliminatedGw: e.eliminated_gw,
+    strategy: e.reserve_strategy,
+    confidenceFloor: Number(e.confidence_floor),
+    picks,
+    usedTeamIds,
+    reservedTeamIds,
+    teams: teamOptions,
+  };
+}
+
+// Fixtures for a gameweek + model probs, shaped for a home/draw/away ProbBar.
+export async function getGameweekFixtures(
+  gw: number,
+): Promise<LmsGameweekFixture[]> {
+  const rows = await q<{
+    fixture: Fixture;
+    homeTeam: Team | null;
+    awayTeam: Team | null;
+    probs: ModelFixtureProbs | null;
+  }>(
+    `select to_jsonb(f.*)  as fixture,
+            to_jsonb(th.*) as "homeTeam",
+            to_jsonb(ta.*) as "awayTeam",
+            to_jsonb(mp.*) as probs
+       from fixtures f
+       left join teams th on th.fpl_id = f.home_team
+       left join teams ta on ta.fpl_id = f.away_team
+       left join model_fixture_probs mp on mp.fixture_id = f.fpl_id
+      where f.gw = $1
+      order by f.kickoff asc nulls last, f.fpl_id asc`,
+    [gw],
+  );
+  return rows.map((r) => ({
+    fixtureId: r.fixture.fpl_id,
+    gw: r.fixture.gw ?? gw,
+    homeTeam: r.homeTeam,
+    awayTeam: r.awayTeam,
+    kickoff: r.fixture.kickoff,
+    finished: r.fixture.finished,
+    pHome: r.probs?.p_home ?? null,
+    pDraw: r.probs?.p_draw ?? null,
+    pAway: r.probs?.p_away ?? null,
+  }));
+}
+
+// The bundle of inputs the pure planner (lib/lmsPlanner.ts) needs. Assembled
+// server-side; the client calls computeForwardPlan() with this (+ any pins) and
+// recomputes live on every override — nothing here is persisted.
+export interface ForwardPlanInputs {
+  entryState: PlannerEntryState;
+  upcomingRounds: PlannerRound[];
+  fixtureProbs: PlannerFixtureProb[];
+  teams: PlannerTeam[];
+  eliteSet: number[];
+}
+
+export async function getForwardPlanInputs(
+  entryId: number,
+  userId: number,
+): Promise<ForwardPlanInputs | null> {
+  const entryRows = await q<{
+    id: number;
+    start_gw: number;
+    reserve_strategy: LmsReserveStrategy;
+    confidence_floor: string;
+  }>(
+    `select e.id, c.start_gw, e.reserve_strategy, e.confidence_floor
+       from lms_entries e
+       join lms_competitions c on c.id = e.competition_id
+      where e.id = $1 and c.user_id = $2`,
+    [entryId, userId],
+  );
+  const e = entryRows[0];
+  if (!e) return null;
+
+  const [usedRows, reserveRows, teamsRows, roundRows, probRows] =
+    await Promise.all([
+      q<{ team_id: number }>(
+        `select team_id from lms_entry_picks where entry_id = $1`,
+        [entryId],
+      ),
+      q<{ team_id: number }>(
+        `select team_id from lms_entry_reserves where entry_id = $1`,
+        [entryId],
+      ),
+      getAllTeams(),
+      q<{ gw: number; lms_eligible: boolean; num_fixtures: number | null }>(
+        `select gw, lms_eligible, num_fixtures from gameweeks
+          where finished = false and gw >= $1 order by gw asc`,
+        [e.start_gw],
+      ),
+      q<{
+        fixture_id: number;
+        gw: number | null;
+        home_team: number | null;
+        away_team: number | null;
+        p_home: number | null;
+        p_draw: number | null;
+        p_away: number | null;
+      }>(
+        `select f.fpl_id as fixture_id, f.gw, f.home_team, f.away_team,
+                mp.p_home, mp.p_draw, mp.p_away
+           from fixtures f
+           join model_fixture_probs mp on mp.fixture_id = f.fpl_id
+          where f.finished = false and f.gw >= $1`,
+        [e.start_gw],
+      ),
+    ]);
+
+  const teams: PlannerTeam[] = teamsRows.map(toPlannerTeam);
+
+  const fixtureProbs: PlannerFixtureProb[] = probRows
+    .filter((r) => r.gw != null && r.home_team != null && r.away_team != null)
+    .map((r) => ({
+      fixtureId: r.fixture_id,
+      gw: r.gw as number,
+      homeTeamId: r.home_team as number,
+      awayTeamId: r.away_team as number,
+      pHome: r.p_home,
+      pDraw: r.p_draw,
+      pAway: r.p_away,
+    }));
+
+  return {
+    entryState: {
+      usedTeamIds: usedRows.map((u) => u.team_id),
+      reservedTeamIds: reserveRows.map((r) => r.team_id),
+      strategy: e.reserve_strategy,
+      confidenceFloor: Number(e.confidence_floor),
+    },
+    upcomingRounds: roundRows.map((r) => ({
+      gw: r.gw,
+      lmsEligible: r.lms_eligible,
+      numFixtures: r.num_fixtures,
+    })),
+    fixtureProbs,
+    teams,
+    eliteSet: computeEliteSet(teams),
+  };
 }
 
 // ---------- history ----------

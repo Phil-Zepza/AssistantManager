@@ -1,11 +1,12 @@
 """FPL/LMS pipeline entrypoint.
 
-Runs the 5 steps from SPEC.md 'What the pipeline must do':
+Runs these steps (see SPEC.md 'What the pipeline must do'):
   1. fetch bootstrap + fixtures -> upsert teams / players / fixtures / gameweeks
   2. update Elo from finished fixtures -> model_fixture_probs for upcoming GWs
   3. model_player_ep for the next GW
   4. per-user squads + recommendations_log
-  5. all upserts idempotent; one summary line per step
+  5. auto-resolve finished LMS rounds -> settle lms_entry_picks + entry status
+All upserts idempotent; one summary line per step.
 
 Run locally:  DATABASE_URL=... python pipeline/run.py
 Requires env: DATABASE_URL (Railway Postgres connection string)
@@ -383,6 +384,82 @@ def _write_user_recs(conn, user, next_gw, ep_by_player, lms_rec) -> int:
     return written
 
 
+def step5_lms_resolve(conn) -> None:
+    """Auto-resolve pending LMS entry picks whose round has fully finished.
+
+    For every lms_entry_picks row with result='pending' in a GW where ALL
+    fixtures are finished: a win -> 'survived', a draw/loss -> 'eliminated'
+    (strict rules: a draw is OUT). On elimination the parent entry is set
+    status='out', eliminated_gw=gw.
+
+    Idempotent: only touches result='pending' rows, and only for fully-finished
+    rounds, so re-runs are no-ops. Reads finished fixtures only. NEVER writes to
+    FPL — this settles OUR own LMS tables. Operates on lms_entry_picks (the
+    rework tables); the deprecated lms_picks table is intentionally left alone.
+    """
+    pending = query(
+        conn,
+        "SELECT id, entry_id, gw, team_id FROM lms_entry_picks WHERE result = 'pending'",
+    )
+    if not pending:
+        print("[step 5] no pending LMS picks; skipped")
+        return
+
+    # For each round with pending picks, is it fully finished, and what are the
+    # per-team scorelines?
+    fixtures_by_gw: dict[int, dict] = {}
+    for gw in sorted({p["gw"] for p in pending}):
+        status = query(
+            conn,
+            "SELECT bool_and(finished) AS all_finished, count(*) AS n "
+            "FROM fixtures WHERE gw = %s",
+            (gw,),
+        )
+        row = status[0] if status else None
+        all_finished = bool(row and row["n"] and row["all_finished"])
+        by_team: dict[int, dict] = {}
+        if all_finished:
+            for fx in query(
+                conn,
+                "SELECT home_team, away_team, home_score, away_score FROM fixtures "
+                "WHERE gw = %s AND finished = true "
+                "AND home_score IS NOT NULL AND away_score IS NOT NULL",
+                (gw,),
+            ):
+                by_team[fx["home_team"]] = {
+                    "is_home": True,
+                    "home_score": fx["home_score"],
+                    "away_score": fx["away_score"],
+                }
+                by_team[fx["away_team"]] = {
+                    "is_home": False,
+                    "home_score": fx["home_score"],
+                    "away_score": fx["away_score"],
+                }
+        fixtures_by_gw[gw] = {"all_finished": all_finished, "by_team": by_team}
+
+    pick_updates, entry_outs = models.resolve_lms_picks(pending, fixtures_by_gw)
+
+    with conn.cursor() as cur:
+        for u in pick_updates:
+            cur.execute(
+                "UPDATE lms_entry_picks SET result = %s "
+                "WHERE id = %s AND result = 'pending'",
+                (u["result"], u["id"]),
+            )
+        for entry_id, gw in entry_outs.items():
+            cur.execute(
+                "UPDATE lms_entries SET status = 'out', eliminated_gw = %s "
+                "WHERE id = %s AND status <> 'out'",
+                (gw, entry_id),
+            )
+
+    print(
+        f"[step 5] resolved {len(pick_updates)} LMS pick(s); "
+        f"{len(entry_outs)} entries newly out"
+    )
+
+
 # ------------------------------ main ------------------------------
 def main() -> int:
     print("Fetching FPL API ...")
@@ -398,6 +475,7 @@ def main() -> int:
         _, exp_goals_by_fixture = step2_elo_and_fixture_probs(conn, bootstrap, fixture_rows)
         step3_player_ep(conn, bootstrap, fixture_rows, exp_goals_by_fixture, next_gw)
         step4_users(conn, current_gw, next_gw)
+        step5_lms_resolve(conn)
 
     print("Pipeline complete.")
     return 0

@@ -6,9 +6,11 @@ import type {
   Gameweek,
   LmsEntry,
   LmsEntryPick,
+  LmsEntryStatus,
   LmsFixtureOption,
   LmsForwardPlan,
   LmsPick,
+  LmsPickResult,
   Team,
 } from "./types";
 
@@ -200,4 +202,45 @@ export function buildForwardPlanPlaceholder(
   }
 
   return plan;
+}
+
+// ---- LMS rework derivations (pure; operate on the reworked Entry shapes) ----
+// These sit alongside the placeholder builders above and are consumed by the
+// reworked reads (lib/queries.ts) and the forthcoming UI. No DB access.
+
+// An entry is OUT once any of its picks is eliminated (strict draw = OUT is
+// applied upstream when a pick's result is settled to 'eliminated' — by the
+// pipeline auto-resolve step or the migration backfill). Returns the derived
+// status and the earliest eliminating round.
+export function deriveEntryStatus(
+  picks: ReadonlyArray<{ gw: number; result: LmsPickResult }>,
+): { status: LmsEntryStatus; eliminatedGw: number | null } {
+  let eliminatedGw: number | null = null;
+  for (const p of picks) {
+    if (
+      p.result === "eliminated" &&
+      (eliminatedGw == null || p.gw < eliminatedGw)
+    ) {
+      eliminatedGw = p.gw;
+    }
+  }
+  return { status: eliminatedGw == null ? "alive" : "out", eliminatedGw };
+}
+
+// Teams already spent by an entry — the single-use pool (fpl_id list).
+export function usedTeamIds(
+  picks: ReadonlyArray<{ team_id: number }>,
+): number[] {
+  return picks.map((p) => p.team_id);
+}
+
+// available = all teams − used − reserved. Reserved teams are only excluded for
+// the active mode (pass [] for safest, which does no reserving). Keyed on fpl_id.
+export function availableTeams(
+  allTeams: Team[],
+  usedIds: Iterable<number>,
+  reservedIds: Iterable<number>,
+): Team[] {
+  const blocked = new Set<number>([...usedIds, ...reservedIds]);
+  return allTeams.filter((t) => !blocked.has(t.fpl_id));
 }
