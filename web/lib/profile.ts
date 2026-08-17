@@ -2,8 +2,8 @@ import "server-only";
 
 import { getEntryHistory } from "./fpl";
 import type {
-  LmsEntry,
   LmsPick,
+  LmsRoundEntry,
   LmsStatus,
   LmsSummary,
   SeasonHistoryRow,
@@ -89,7 +89,7 @@ export function summariseLms(
   picks: LmsPick[],
   teams: Map<number, Team>,
 ): LmsSummary {
-  const rounds: LmsEntry[] = picks.map((p) => ({
+  const rounds: LmsRoundEntry[] = picks.map((p) => ({
     round_gw: p.round_gw,
     teamShort: p.team_id != null ? (teams.get(p.team_id)?.short_name ?? null) : null,
     result: p.result,

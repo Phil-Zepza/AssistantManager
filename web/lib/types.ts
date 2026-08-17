@@ -184,10 +184,11 @@ export interface SeasonHistoryRow {
   isCurrent: boolean; // the in-progress season, tagged in the UI
 }
 
-// One LMS entry (round pick) with a derived survival status for the profile.
+// One LMS round pick with a derived survival status, for the profile card.
+// (Distinct from the /lms canvas `LmsEntry` below, which models a whole run.)
 export type LmsStatus = "alive" | "out" | "pending";
 
-export interface LmsEntry {
+export interface LmsRoundEntry {
   round_gw: number;
   teamShort: string | null; // backed team short name (null if unknown)
   result: string | null; // win / draw / loss / pending (raw)
@@ -197,5 +198,49 @@ export interface LmsEntry {
 export interface LmsSummary {
   entries: number; // number of round picks on record
   alive: boolean; // still in it (no round lost/drawn yet)
-  rounds: LmsEntry[];
+  rounds: LmsRoundEntry[];
 }
+
+// ---- LMS canvas view models (/lms) ----
+
+// One team already spent by an entry in a past round.
+export interface LmsEntryPick {
+  roundGw: number;
+  team: Team | null;
+  result: string | null; // win / draw / loss / pending
+  survived: boolean | null;
+}
+
+// An LMS entry (one run through the competition). The primary entry is
+// DB-backed (lms_picks); further entries are independent tracks. Entries are
+// fully independent: their own used teams, status and recommendation.
+export interface LmsEntry {
+  id: string; // "entry-1"
+  label: string; // "Entry 1"
+  /** True once a draw/loss has knocked this entry out. */
+  eliminated: boolean;
+  /** Rounds already spent (used teams), oldest first. */
+  picks: LmsEntryPick[];
+  /** Only the primary entry persists to the DB; others are placeholders. */
+  persisted: boolean;
+}
+
+// Forward plan (next five 7+-game rounds). The team allocation is placeholder
+// logic — see LmsForwardPlan (// TODO wire the allocation engine).
+export interface LmsForwardReserved {
+  code: string; // teams.short_name held back
+  isHome: boolean;
+  reason: string;
+}
+
+export interface LmsForwardRound {
+  round: number; // gw
+  qualifies: boolean; // 7+ fixtures — counts for LMS
+  numFixtures: number | null;
+  provisionalPick: { code: string; isHome: boolean } | null;
+  winProb: number | null;
+  reason: string;
+  reserved: LmsForwardReserved[];
+}
+
+export type LmsForwardPlan = LmsForwardRound[];

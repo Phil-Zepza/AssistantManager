@@ -1,6 +1,7 @@
 import { q } from "./db";
 import type {
   Fixture,
+  Gameweek,
   LmsFixtureOption,
   LmsPick,
   ModelFixtureProbs,
@@ -332,6 +333,28 @@ export async function getLmsFixtureOptions(
   // Rank by the backed team's win probability (desc); nulls last.
   options.sort((a, b) => (b.pickWinProb ?? -1) - (a.pickWinProb ?? -1));
   return options;
+}
+
+// All teams (reference data), ordered by name. Used by the LMS canvas to render
+// the "used this season" and "available" team pools. Open to any signed-in user
+// (contains no per-user rows).
+export async function getAllTeams(): Promise<Team[]> {
+  return q<Team>(`select * from teams order by name asc`);
+}
+
+// Upcoming gameweeks from `fromGw` (inclusive), for the LMS forward plan. Kept
+// deliberately un-filtered on eligibility: the plan renders honest "skipped ·
+// under 7" markers for sub-7-fixture rounds, so it needs those rows too.
+// Reference data — open to any signed-in user.
+export async function getUpcomingGameweeks(
+  fromGw: number | null,
+  limit = 14,
+): Promise<Gameweek[]> {
+  if (fromGw == null) return [];
+  return q<Gameweek>(
+    `select * from gameweeks where gw >= $1 order by gw asc limit $2`,
+    [fromGw, limit],
+  );
 }
 
 // Recommended LMS pick = highest win prob among fixtures whose backed team
