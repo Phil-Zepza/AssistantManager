@@ -248,48 +248,48 @@ export default function SquadEditor({
   return (
     <div className="space-y-4">
       {/* ---- summary bar ---- */}
-      <div className="sticky top-0 z-10 -mx-4 border-b border-gray-200 bg-white/95 px-4 py-3 backdrop-blur sm:mx-0 sm:rounded-xl sm:border">
+      <div className="sticky top-0 z-10 -mx-4 border-b border-subtle bg-base/95 px-4 py-3 backdrop-blur sm:mx-0 sm:rounded-xl sm:border">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div>
-            <div className="text-xs font-semibold uppercase tracking-wide text-gray-500">
+            <div className="text-xs font-semibold uppercase tracking-wide text-secondary">
               Squad cost
             </div>
             <div
               className={`text-lg font-bold ${
-                overBudget ? "text-red-600" : "text-brand"
+                overBudget ? "text-danger" : "text-accent"
               }`}
             >
               {formatPrice(cost)}
-              <span className="ml-1 text-xs font-normal text-gray-400">
+              <span className="ml-1 text-xs font-normal text-muted">
                 / {formatPrice(BUDGET_CAP_TENTHS)}
               </span>
             </div>
           </div>
           <div>
-            <div className="text-xs font-semibold uppercase tracking-wide text-gray-500">
+            <div className="text-xs font-semibold uppercase tracking-wide text-secondary">
               Players
             </div>
-            <div className="text-lg font-bold text-gray-800">
+            <div className="text-lg font-bold text-primary">
               {picks.length}
-              <span className="text-xs font-normal text-gray-400">
+              <span className="text-xs font-normal text-muted">
                 /{SQUAD_SIZE}
               </span>
             </div>
           </div>
           <div>
-            <div className="text-xs font-semibold uppercase tracking-wide text-gray-500">
+            <div className="text-xs font-semibold uppercase tracking-wide text-secondary">
               Proj. XI
             </div>
-            <div className="text-lg font-bold text-brand">
+            <div className="text-lg font-bold text-accent">
               {formatEp(projectedXi)}
-              <span className="ml-1 text-xs font-normal text-gray-400">xPts</span>
+              <span className="ml-1 text-xs font-normal text-muted">xPts</span>
             </div>
           </div>
           <button
             type="button"
             onClick={onSave}
             disabled={!canSave}
-            className="rounded-lg bg-brand px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-40"
+            className="rounded-lg bg-accent px-4 py-2 text-sm font-semibold text-on-accent disabled:cursor-not-allowed disabled:opacity-40"
           >
             {saving ? "Saving…" : "Save squad"}
           </button>
@@ -306,8 +306,8 @@ export default function SquadEditor({
                 key={pos}
                 className={`rounded-full px-2 py-0.5 font-medium ${
                   done
-                    ? "bg-green-100 text-green-800"
-                    : "bg-gray-100 text-gray-600"
+                    ? "bg-[rgba(34,197,94,0.15)] text-success"
+                    : "bg-surface-2 text-secondary"
                 }`}
               >
                 {pos} {have}/{need}
@@ -317,7 +317,7 @@ export default function SquadEditor({
         </div>
 
         {overBudget && (
-          <p className="mt-2 text-xs font-medium text-red-600">
+          <p className="mt-2 text-xs font-medium text-danger">
             Over the £{(BUDGET_CAP_TENTHS / 10).toFixed(1)}m budget by{" "}
             {formatPrice(cost - BUDGET_CAP_TENTHS)} — you can still save, but a
             real FPL squad must be within budget.
@@ -325,24 +325,24 @@ export default function SquadEditor({
         )}
 
         {errors.length > 0 && (
-          <ul className="mt-2 space-y-0.5 text-xs text-gray-500">
+          <ul className="mt-2 space-y-0.5 text-xs text-secondary">
             {errors.slice(0, 3).map((e) => (
               <li key={e}>• {e}</li>
             ))}
           </ul>
         )}
         {saveError && (
-          <p className="mt-2 text-xs font-medium text-red-600">{saveError}</p>
+          <p className="mt-2 text-xs font-medium text-danger">{saveError}</p>
         )}
       </div>
 
       {/* ---- your squad ---- */}
       <section>
-        <h2 className="mb-2 text-sm font-semibold uppercase tracking-wide text-gray-500">
+        <h2 className="mb-2 text-sm font-semibold uppercase tracking-wide text-secondary">
           Starting XI
         </h2>
         {starters.length === 0 ? (
-          <p className="rounded-lg border border-dashed border-gray-300 bg-white px-3 py-4 text-center text-sm text-gray-500">
+          <p className="rounded-lg border border-dashed border-strong bg-surface px-3 py-4 text-center text-sm text-secondary">
             Add players from the list below to build your XI.
           </p>
         ) : (
@@ -366,14 +366,14 @@ export default function SquadEditor({
           </div>
         )}
 
-        <h2 className="mb-2 mt-5 text-sm font-semibold uppercase tracking-wide text-gray-500">
+        <h2 className="mb-2 mt-5 text-sm font-semibold uppercase tracking-wide text-secondary">
           Bench{" "}
-          <span className="font-normal normal-case text-gray-400">
+          <span className="font-normal normal-case text-muted">
             (in order)
           </span>
         </h2>
         {orderedBench.length === 0 ? (
-          <p className="rounded-lg border border-dashed border-gray-300 bg-white px-3 py-4 text-center text-sm text-gray-500">
+          <p className="rounded-lg border border-dashed border-strong bg-surface px-3 py-4 text-center text-sm text-secondary">
             Your 4 substitutes appear here.
           </p>
         ) : (
@@ -404,7 +404,7 @@ export default function SquadEditor({
 
       {/* ---- add players ---- */}
       <section>
-        <h2 className="mb-2 mt-2 text-sm font-semibold uppercase tracking-wide text-gray-500">
+        <h2 className="mb-2 mt-2 text-sm font-semibold uppercase tracking-wide text-secondary">
           Add players
         </h2>
         <div className="mb-2 flex flex-col gap-2 sm:flex-row">
@@ -412,7 +412,7 @@ export default function SquadEditor({
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             placeholder="Search player or club…"
-            className="w-full rounded-lg border border-gray-300 px-3 py-2 text-base focus:border-brand focus:outline-none focus:ring-1 focus:ring-brand"
+            className="w-full rounded-lg border border-strong px-3 py-2 text-base focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent"
           />
           <div className="flex gap-1">
             {(["ALL", ...POSITION_ORDER] as const).map((pos) => (
@@ -422,8 +422,8 @@ export default function SquadEditor({
                 onClick={() => setPosFilter(pos)}
                 className={`rounded-lg px-3 py-2 text-sm font-medium ${
                   posFilter === pos
-                    ? "bg-brand text-white"
-                    : "bg-gray-100 text-gray-600 hover:bg-gray-200"
+                    ? "bg-accent text-on-accent"
+                    : "bg-surface-2 text-secondary hover:bg-surface"
                 }`}
               >
                 {pos}
@@ -433,7 +433,7 @@ export default function SquadEditor({
         </div>
 
         {filtered.length === 0 ? (
-          <p className="rounded-lg border border-dashed border-gray-300 bg-white px-3 py-4 text-center text-sm text-gray-500">
+          <p className="rounded-lg border border-dashed border-strong bg-surface px-3 py-4 text-center text-sm text-secondary">
             No players match your search.
           </p>
         ) : (
@@ -469,7 +469,7 @@ export default function SquadEditor({
               );
             })}
             {filtered.length >= MAX_LIST_ROWS && (
-              <p className="px-1 pt-1 text-xs text-gray-400">
+              <p className="px-1 pt-1 text-xs text-muted">
                 Showing the first {MAX_LIST_ROWS} — refine your search to see
                 more.
               </p>
@@ -491,10 +491,10 @@ function orderedBenchIds(order: number[], benchPicks: Pick[]): number[] {
 }
 
 function difficultyTone(diff: number | null): string {
-  if (diff == null) return "bg-gray-100 text-gray-500";
-  if (diff <= 2) return "bg-green-100 text-green-800";
-  if (diff === 3) return "bg-gray-200 text-gray-700";
-  return "bg-red-100 text-red-700";
+  if (diff == null) return "bg-surface-2 text-secondary";
+  if (diff <= 2) return "bg-[rgba(34,197,94,0.15)] text-success";
+  if (diff === 3) return "bg-surface-2 text-secondary";
+  return "bg-[rgba(244,63,94,0.15)] text-danger";
 }
 
 function availabilityLabel(
@@ -517,7 +517,7 @@ function availabilityLabel(
 function FixtureTag({ entry }: { entry: PickPoolEntry }) {
   const nf = entry.next_fixture;
   if (!nf || !nf.opponent?.short_name) {
-    return <span className="text-xs text-gray-400">—</span>;
+    return <span className="text-xs text-muted">—</span>;
   }
   return (
     <span
@@ -551,22 +551,22 @@ function PoolRow({
   const p = entry.player;
   const avail = availabilityLabel(p.status, p.chance_next);
   return (
-    <div className="flex items-center justify-between gap-2 rounded-lg border border-gray-200 bg-white px-3 py-2">
+    <div className="flex items-center justify-between gap-2 rounded-lg border border-subtle bg-surface px-3 py-2">
       <div className="min-w-0">
         <div className="flex items-center gap-1.5">
           <Badge tone="gray">{p.position}</Badge>
           <span className="truncate font-medium">{p.web_name}</span>
-          <span className="text-xs text-gray-400">
+          <span className="text-xs text-muted">
             {entry.team?.short_name ?? ""}
           </span>
           {avail && (
             <Badge tone={avail.tone}>{avail.text}</Badge>
           )}
         </div>
-        <div className="mt-0.5 flex items-center gap-2 text-xs text-gray-500">
+        <div className="mt-0.5 flex items-center gap-2 text-xs text-secondary">
           <span>{formatPrice(p.price)}</span>
           <span>·</span>
-          <span className="font-semibold text-brand">
+          <span className="font-semibold text-accent">
             {formatEp(entry.expected_points)} xPts
           </span>
           <span>·</span>
@@ -578,7 +578,7 @@ function PoolRow({
         <button
           type="button"
           onClick={onRemove}
-          className="shrink-0 rounded-lg border border-gray-300 px-3 py-1.5 text-sm font-medium text-gray-600 hover:bg-gray-50"
+          className="shrink-0 rounded-lg border border-strong px-3 py-1.5 text-sm font-medium text-secondary hover:bg-surface-2"
         >
           Remove
         </button>
@@ -588,7 +588,7 @@ function PoolRow({
           onClick={onAdd}
           disabled={blocked}
           title={blocked && blockReason ? blockReason : undefined}
-          className="shrink-0 rounded-lg bg-brand px-3 py-1.5 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:bg-gray-200 disabled:text-gray-400"
+          className="shrink-0 rounded-lg bg-accent px-3 py-1.5 text-sm font-semibold text-on-accent disabled:cursor-not-allowed disabled:bg-surface-2 disabled:text-muted"
         >
           {blocked && blockReason ? blockReason : "Add"}
         </button>
@@ -625,21 +625,21 @@ function SelectedRow({
   const p = entry.player;
   const onBench = pick.onBench;
   return (
-    <div className="flex items-center justify-between gap-2 rounded-lg border border-gray-200 bg-white px-3 py-2">
+    <div className="flex items-center justify-between gap-2 rounded-lg border border-subtle bg-surface px-3 py-2">
       <div className="flex min-w-0 items-center gap-1.5">
         {benchIndex != null && (
-          <span className="text-xs font-semibold text-gray-400">
+          <span className="text-xs font-semibold text-muted">
             {benchIndex + 1}.
           </span>
         )}
         <Badge tone="gray">{p.position}</Badge>
         <span className="truncate font-medium">{p.web_name}</span>
-        <span className="text-xs text-gray-400">
+        <span className="text-xs text-muted">
           {entry.team?.short_name ?? ""}
         </span>
         {pick.isCaptain && <Badge tone="purple">C</Badge>}
         {pick.isVice && <Badge tone="gray">V</Badge>}
-        <span className="ml-1 text-xs text-gray-500">
+        <span className="ml-1 text-xs text-secondary">
           {formatPrice(p.price)} · {formatEp(entry.expected_points)}
         </span>
         <FixtureTag entry={entry} />
@@ -667,7 +667,7 @@ function SelectedRow({
               onClick={onMoveUp}
               disabled={!onMoveUp}
               aria-label="Move up"
-              className="px-1 text-xs text-gray-500 disabled:opacity-30"
+              className="px-1 text-xs text-secondary disabled:opacity-30"
             >
               ▲
             </button>
@@ -676,7 +676,7 @@ function SelectedRow({
               onClick={onMoveDown}
               disabled={!onMoveDown}
               aria-label="Move down"
-              className="px-1 text-xs text-gray-500 disabled:opacity-30"
+              className="px-1 text-xs text-secondary disabled:opacity-30"
             >
               ▼
             </button>
@@ -695,7 +695,7 @@ function SelectedRow({
                 ? "Bench is full"
                 : "Move to bench"
           }
-          className="rounded-lg border border-gray-300 px-2 py-1 text-xs font-medium text-gray-600 hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-40"
+          className="rounded-lg border border-strong px-2 py-1 text-xs font-medium text-secondary hover:bg-surface-2 disabled:cursor-not-allowed disabled:opacity-40"
         >
           {onBench ? "→ XI" : "Bench"}
         </button>
@@ -703,7 +703,7 @@ function SelectedRow({
           type="button"
           onClick={onRemove}
           aria-label="Remove player"
-          className="rounded-lg border border-gray-300 px-2 py-1 text-xs font-medium text-gray-600 hover:bg-gray-50"
+          className="rounded-lg border border-strong px-2 py-1 text-xs font-medium text-secondary hover:bg-surface-2"
         >
           ✕
         </button>
@@ -731,8 +731,8 @@ function IconBtn({
       aria-pressed={active}
       className={`h-7 w-7 rounded-full text-xs font-bold ${
         active
-          ? "bg-brand text-white"
-          : "border border-gray-300 text-gray-500 hover:bg-gray-50"
+          ? "bg-accent text-on-accent"
+          : "border border-strong text-secondary hover:bg-surface-2"
       }`}
     >
       {children}

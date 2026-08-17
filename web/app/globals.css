@@ -2,11 +2,125 @@
 @tailwind components;
 @tailwind utilities;
 
+/*
+ * Dark design system — tokens.
+ * These CSS custom properties are the single source of truth; the Tailwind
+ * theme (tailwind.config.ts) maps utility classes onto them, so a token change
+ * here propagates everywhere. The very base app background is --bg-base.
+ */
 :root {
-  color-scheme: light;
+  color-scheme: dark;
+
+  /* Surfaces */
+  --bg-base: #06080c;
+  --bg-raised: #121722;
+  --surface: #1a2130;
+  --surface-2: #232c3d;
+
+  /* Borders */
+  --border: rgba(255, 255, 255, 0.08);
+  --border-strong: #3a465a;
+
+  /* Text */
+  --text-primary: #f4f7fb;
+  --text-secondary: #a7b1c2;
+  --text-muted: #6b7688;
+
+  /* Accent (pitch green) */
+  --accent: #16e1a3;
+  --accent-press: #0fc98f;
+  --on-accent: #08130e;
+
+  /* Hot / "suggested" (captain, deadline urgency) */
+  --accent-2: #ff2d78;
+
+  /* Semantic */
+  --success: #22c55e;
+  --warning: #f5b400;
+  --on-warning: #1a1400;
+  --danger: #f43f5e;
+  --info: #3b9eff;
+
+  /* Positions */
+  --pos-gk: #eab308;
+  --pos-def: #14b8a6;
+  --pos-mid: #6366f1;
+  --pos-fwd: #ec4899;
+
+  /* Pitch */
+  --pitch-top: #1e7a46;
+  --pitch-bottom: #123e28;
+  --pitch-line: rgba(255, 255, 255, 0.22);
+
+  /* Radii */
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 20px;
+
+  /* Elevation */
+  --shadow-card: 0 1px 0 rgba(255, 255, 255, 0.04) inset, 0 8px 24px rgba(0, 0, 0, 0.35);
+  --shadow-sheet: 0 1px 0 rgba(255, 255, 255, 0.05) inset, 0 -8px 48px rgba(0, 0, 0, 0.55);
+  --shadow-dock: 0 -8px 24px rgba(0, 0, 0, 0.45);
+
+  /* Motion */
+  --motion-micro: 150ms;
+  --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 
 html,
 body {
-  @apply bg-gray-50 text-gray-900 antialiased;
+  background-color: var(--bg-base);
+  color: var(--text-primary);
+  font-family: var(--font-sans), -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+@layer utilities {
+  /* Numeric data (prices, points, %, budget, countdown). */
+  .tnum {
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum" 1;
+  }
+
+  /* Pitch-green radial glow used behind the login hero. */
+  .glow-pitch {
+    background-image: radial-gradient(
+      60% 55% at 50% 0%,
+      rgba(22, 225, 163, 0.22) 0%,
+      rgba(22, 225, 163, 0.06) 40%,
+      transparent 72%
+    );
+  }
+}
+
+/* BottomSheet entrance — only when the user hasn't asked to reduce motion. */
+@media (prefers-reduced-motion: no-preference) {
+  .bs-backdrop {
+    animation: bs-fade var(--motion-micro) var(--ease-out);
+  }
+  .bs-panel {
+    animation: bs-rise 200ms var(--ease-out);
+  }
+}
+
+@keyframes bs-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes bs-rise {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }

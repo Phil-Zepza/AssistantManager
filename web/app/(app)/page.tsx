@@ -79,42 +79,42 @@ export default async function DashboardPage() {
       />
 
       {/* Recommended captain */}
-      <Card className="mb-4 border-brand/30">
+      <Card className="mb-4 border-strong">
         <div className="flex items-center justify-between">
           <div>
-            <p className="text-xs font-semibold uppercase tracking-wide text-gray-500">
+            <p className="text-xs font-semibold uppercase tracking-wide text-secondary">
               Recommended captain
             </p>
             {captain ? (
-              <p className="mt-0.5 text-lg font-bold text-brand">
+              <p className="mt-0.5 text-lg font-bold text-accent">
                 {captain.player.web_name}{" "}
-                <span className="text-sm font-normal text-gray-500">
+                <span className="text-sm font-normal text-secondary">
                   {captain.team?.short_name ?? ""}
                 </span>
               </p>
             ) : (
-              <p className="mt-0.5 text-sm text-gray-500">
+              <p className="mt-0.5 text-sm text-secondary">
                 No projections available yet.
               </p>
             )}
           </div>
           {captain && (
             <div className="text-right">
-              <div className="text-2xl font-bold text-brand">
+              <div className="text-2xl font-bold text-accent">
                 {formatEp(captain.expected_points)}
               </div>
-              <div className="text-xs text-gray-500">xPts</div>
+              <div className="text-xs text-secondary">xPts</div>
             </div>
           )}
         </div>
       </Card>
 
       {/* Chip note */}
-      <Card className="mb-2 bg-amber-50">
-        <p className="text-xs font-semibold uppercase tracking-wide text-amber-700">
+      <Card className="mb-2 bg-[rgba(245,180,0,0.10)]">
+        <p className="text-xs font-semibold uppercase tracking-wide text-warning">
           Chip status
         </p>
-        <p className="mt-0.5 text-sm text-gray-700">
+        <p className="mt-0.5 text-sm text-secondary">
           {chipNote ?? "No chip recommended this week — hold your chips."}
         </p>
       </Card>
@@ -129,7 +129,7 @@ export default async function DashboardPage() {
           />
           <Link
             href="/squad/edit"
-            className="mt-3 inline-flex w-full items-center justify-center rounded-lg bg-brand px-4 py-2.5 font-semibold text-white sm:w-auto"
+            className="mt-3 inline-flex w-full items-center justify-center rounded-lg bg-accent px-4 py-2.5 font-semibold text-on-accent sm:w-auto"
           >
             Pick your squad
           </Link>
@@ -140,7 +140,7 @@ export default async function DashboardPage() {
             <SectionTitle>Starting XI</SectionTitle>
             <Link
               href="/squad/edit"
-              className="text-sm font-medium text-brand hover:underline"
+              className="text-sm font-medium text-accent hover:underline"
             >
               Edit squad
             </Link>
@@ -175,7 +175,7 @@ export default async function DashboardPage() {
 
       {/* Best transfer panel */}
       <SectionTitle>Best transfer targets</SectionTitle>
-      <p className="mb-2 text-xs text-gray-500">
+      <p className="mb-2 text-xs text-secondary">
         Highest projected players by position that you don&apos;t own.
       </p>
       {transfers.length === 0 ? (
@@ -191,19 +191,19 @@ export default async function DashboardPage() {
                 <div className="flex items-center gap-2">
                   <Badge tone="purple">{t.position}</Badge>
                   <span className="font-semibold">{t.player.web_name}</span>
-                  <span className="text-sm text-gray-500">
+                  <span className="text-sm text-secondary">
                     {t.team?.short_name ?? ""}
                   </span>
                 </div>
-                <div className="mt-0.5 text-xs text-gray-500">
+                <div className="mt-0.5 text-xs text-secondary">
                   {formatPrice(t.player.price)}
                 </div>
               </div>
               <div className="text-right">
-                <div className="font-bold text-brand">
+                <div className="font-bold text-accent">
                   {formatEp(t.expected_points)}
                 </div>
-                <div className="text-xs text-gray-500">xPts</div>
+                <div className="text-xs text-secondary">xPts</div>
               </div>
             </Card>
           ))}
@@ -226,14 +226,14 @@ function PlayerRow({
 }) {
   return (
     <div
-      className={`flex items-center justify-between rounded-lg border bg-white px-3 py-2 ${
-        isCaptainRec ? "border-brand-accent ring-1 ring-brand-accent" : "border-gray-200"
+      className={`flex items-center justify-between rounded-lg border bg-surface px-3 py-2 ${
+        isCaptainRec ? "border-accent ring-1 ring-accent" : "border-subtle"
       }`}
     >
       <div className="flex items-center gap-2">
         <Badge tone="gray">{entry.player.position}</Badge>
         <span className="font-medium">{entry.player.web_name}</span>
-        <span className="text-sm text-gray-400">
+        <span className="text-sm text-muted">
           {entry.team?.short_name ?? ""}
         </span>
         {entry.is_captain && <Badge tone="purple">C</Badge>}
@@ -241,10 +241,10 @@ function PlayerRow({
         {isCaptainRec && <Badge tone="green">Rec. C</Badge>}
       </div>
       <div className="text-right">
-        <span className="font-semibold text-brand">
+        <span className="font-semibold text-accent">
           {formatEp(entry.expected_points)}
         </span>
-        <span className="ml-1 text-xs text-gray-400">xPts</span>
+        <span className="ml-1 text-xs text-muted">xPts</span>
       </div>
     </div>
   );
