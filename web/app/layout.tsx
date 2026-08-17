@@ -12,15 +12,15 @@ const inter = Inter({
 
 export const metadata: Metadata = {
   title: {
-    default: "FPL / LMS Assistant",
-    template: "%s · FPL / LMS",
+    default: "AI Gaffer",
+    template: "%s · AI Gaffer",
   },
-  description: "Fantasy Premier League and Last Man Standing assistant",
-  applicationName: "FPL/LMS Assistant",
+  description: "Your AI football manager — FPL squad, transfers, chips, and LMS survival",
+  applicationName: "AI Gaffer",
   manifest: "/manifest.webmanifest",
   appleWebApp: {
     capable: true,
-    title: "FPL/LMS",
+    title: "AI Gaffer",
     statusBarStyle: "black-translucent",
   },
 };
