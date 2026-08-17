@@ -1,6 +1,8 @@
 import Link from "next/link";
 import { redirect } from "next/navigation";
+import { cookies } from "next/headers";
 import { auth } from "@/auth";
+import { ONBOARDING_SKIP_COOKIE } from "@/lib/onboarding";
 import { getCurrentGw } from "@/lib/gameweek";
 import {
   getCurrentUser,
@@ -27,12 +29,20 @@ export default async function DashboardPage() {
   const user = await getCurrentUser(userId);
   if (!user) redirect("/login");
 
-  // First-login onboarding.
+  // First-login onboarding. Send un-linked users to the focused onboarding
+  // screen, unless they chose "Do this later" (cookie) — in which case we let
+  // them into the app and show a styled inline nudge here instead.
   if (user.fpl_entry_id == null) {
+    const skipped =
+      (await cookies()).get(ONBOARDING_SKIP_COOKIE)?.value === "1";
+    if (!skipped) redirect("/onboarding");
     return (
       <div>
-        <PageHeader title="Welcome" subtitle="One quick step to get started." />
-        <FplIdOnboard userId={user.id} />
+        <PageHeader
+          title="This week"
+          subtitle="Link your FPL team to unlock picks and recommendations."
+        />
+        <FplIdOnboard />
       </div>
     );
   }

@@ -173,6 +173,34 @@ export interface LmsFixtureOption {
   alreadyUsed: boolean;
 }
 
+// ---- Profile view models ----
+
+// One row of the season-history table (Profile). Derived from the FPL
+// entry/{id}/history/ endpoint (past seasons + the in-progress season).
+export interface SeasonHistoryRow {
+  season: string; // e.g. "2024/25"
+  overallRank: number | null; // final (past) or latest (current) overall rank
+  points: number | null; // total points that season
+  isCurrent: boolean; // the in-progress season, tagged in the UI
+}
+
+// One LMS round pick with a derived survival status, for the profile card.
+// (Distinct from the /lms canvas `LmsEntry` below, which models a whole run.)
+export type LmsStatus = "alive" | "out" | "pending";
+
+export interface LmsRoundEntry {
+  round_gw: number;
+  teamShort: string | null; // backed team short name (null if unknown)
+  result: string | null; // win / draw / loss / pending (raw)
+  status: LmsStatus; // derived: strict "draw = out"
+}
+
+export interface LmsSummary {
+  entries: number; // number of round picks on record
+  alive: boolean; // still in it (no round lost/drawn yet)
+  rounds: LmsRoundEntry[];
+}
+
 // ---- LMS canvas view models (/lms) ----
 
 // One team already spent by an entry in a past round.
