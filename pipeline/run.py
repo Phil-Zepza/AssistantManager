@@ -279,8 +279,15 @@ def _sync_user_squad(conn, user, current_gw) -> int:
     if current_gw is None:
         return 0
     picks = fpl_api.get_entry_picks(user["fpl_entry_id"], current_gw)
+    # IMPORTANT: only ever overwrite user_squad when the FPL picks endpoint
+    # actually returns data. `get_entry_picks` returns None on a 404 (picks are
+    # not published until AFTER the GW deadline), so pre-deadline we bail out
+    # here WITHOUT touching user_squad. This is what protects a manually-entered
+    # squad (see web /squad/edit) from being wiped: we never DELETE, and the
+    # upsert below only runs when real picks exist. A blank/404 response leaves
+    # any existing rows for this (user, gw) exactly as they were.
     if not picks or "picks" not in picks:
-        return 0  # 404 before deadline, or no data
+        return 0  # 404 before deadline, or no data — do NOT clear existing rows
     rows = []
     for p in picks["picks"]:
         rows.append(

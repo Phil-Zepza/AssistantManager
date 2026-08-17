@@ -1,5 +1,5 @@
 import "server-only";
-import { Pool } from "pg";
+import { Pool, type PoolClient } from "pg";
 
 // Shared pg Pool on DATABASE_URL. SERVER-ONLY: never import this from a client
 // component. The `server-only` import above turns any accidental client import
@@ -27,4 +27,24 @@ export async function q<T = Record<string, unknown>>(
 ): Promise<T[]> {
   const res = await pool.query(sql, params ? [...params] : undefined);
   return res.rows as T[];
+}
+
+// Run `fn` inside a single transaction (BEGIN/COMMIT, ROLLBACK on throw).
+// SERVER-ONLY. Use for multi-statement writes that must be atomic, e.g.
+// replacing a user's squad rows for a gameweek.
+export async function tx<T>(
+  fn: (client: PoolClient) => Promise<T>,
+): Promise<T> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const result = await fn(client);
+    await client.query("COMMIT");
+    return result;
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
 }
