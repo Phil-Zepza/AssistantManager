@@ -128,6 +128,82 @@ export async function saveSquad(input: {
   redirect("/");
 }
 
+// Record + lock an LMS pick for a round. This is the app's one legitimate
+// domain write (we own the LMS game). The user id comes from the server session
+// — client input is never trusted for scoping. Rules enforced here:
+//  - the round must be a real, LMS-eligible (7+ fixtures), unfinished GW;
+//  - the backed team must have a fixture in that round and not already be spent
+//    by this user in an earlier round (single-use per season);
+//  - a pick is single-use per round: once recorded it can't be changed (draw =
+//    OUT, so locking matters), enforced by the (user_id, round_gw) primary key.
+export async function saveLmsPick(input: {
+  roundGw: number;
+  teamId: number;
+}): Promise<{ ok: boolean; error?: string }> {
+  const session = await auth();
+  const userId = session?.user?.id;
+  if (!userId) throw new Error("Not authenticated");
+
+  const roundGw = Number(input.roundGw);
+  const teamId = Number(input.teamId);
+  if (!Number.isInteger(roundGw) || roundGw <= 0) {
+    return { ok: false, error: "Invalid round." };
+  }
+  if (!Number.isInteger(teamId) || teamId <= 0) {
+    return { ok: false, error: "Invalid team." };
+  }
+
+  // Round must exist and be LMS-eligible + not finished.
+  const gwRows = await q<{ lms_eligible: boolean; finished: boolean }>(
+    `select lms_eligible, finished from gameweeks where gw = $1`,
+    [roundGw],
+  );
+  if (gwRows.length === 0) return { ok: false, error: "Unknown round." };
+  if (!gwRows[0].lms_eligible) {
+    return { ok: false, error: "Round has fewer than 7 fixtures." };
+  }
+  if (gwRows[0].finished) {
+    return { ok: false, error: "That round is already finished." };
+  }
+
+  // The backed team must actually play in this round.
+  const playsRows = await q<{ n: string }>(
+    `select count(*)::text as n from fixtures
+       where gw = $1 and (home_team = $2 or away_team = $2)`,
+    [roundGw, teamId],
+  );
+  if (!playsRows[0] || Number(playsRows[0].n) === 0) {
+    return { ok: false, error: "That team has no fixture this round." };
+  }
+
+  // Single-use per season: reject a team already spent in an earlier round.
+  const usedRows = await q<{ round_gw: number }>(
+    `select round_gw from lms_picks where user_id = $1 and team_id = $2`,
+    [userId, teamId],
+  );
+  const usedElsewhere = usedRows.some((r) => r.round_gw !== roundGw);
+  if (usedElsewhere) {
+    return { ok: false, error: "That team is already used this season." };
+  }
+
+  // Locked: a pick for this round can't be changed once recorded.
+  const existing = await q<{ team_id: number | null }>(
+    `select team_id from lms_picks where user_id = $1 and round_gw = $2`,
+    [userId, roundGw],
+  );
+  if (existing.length > 0) {
+    return { ok: false, error: "This round's pick is already locked." };
+  }
+
+  await q(
+    `insert into lms_picks (user_id, round_gw, team_id, result, survived)
+       values ($1, $2, $3, 'pending', null)`,
+    [userId, roundGw, teamId],
+  );
+  revalidatePath("/lms");
+  return { ok: true };
+}
+
 // Sign out and return to /login.
 export async function signOutAction(): Promise<void> {
   await signOut({ redirectTo: "/login" });
