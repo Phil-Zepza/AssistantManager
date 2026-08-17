@@ -3,22 +3,20 @@ import { redirect } from "next/navigation";
 import { auth } from "@/auth";
 import { getCurrentGw } from "@/lib/gameweek";
 import {
-  getBestTransfers,
   getCurrentUser,
+  getPlayerPool,
   getRecommendations,
   getSquad,
   recommendedCaptain,
 } from "@/lib/queries";
+import { bestSquadTransfer, squadSummary } from "@/lib/projections";
+import { formationFromCounts } from "@/lib/pitch";
 import { formatEp, formatPrice } from "@/lib/format";
 import FplIdOnboard from "@/components/FplIdOnboard";
-import {
-  Badge,
-  Card,
-  EmptyState,
-  PageHeader,
-  SectionTitle,
-} from "@/components/ui";
-import type { SquadEntry } from "@/lib/types";
+import { Badge, Button, Card, EmptyState, PageHeader } from "@/components/ui";
+import { DashboardCaptainCard } from "@/components/fpl/DashboardCaptainCard";
+import { DashboardTransferCard } from "@/components/fpl/DashboardTransferCard";
+import type { Position, SquadEntry } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 
@@ -33,27 +31,18 @@ export default async function DashboardPage() {
   if (user.fpl_entry_id == null) {
     return (
       <div>
-        <PageHeader
-          title="Welcome"
-          subtitle="One quick step to get started."
-        />
+        <PageHeader title="Welcome" subtitle="One quick step to get started." />
         <FplIdOnboard userId={user.id} />
       </div>
     );
   }
 
   const currentGw = await getCurrentGw();
-  const { gw: squadGw, entries } = await getSquad(
-    userId,
-    currentGw?.gw ?? null,
-  );
+  const { gw: squadGw, entries } = await getSquad(userId, currentGw?.gw ?? null);
+  const pool = await getPlayerPool(squadGw ?? currentGw?.gw ?? null);
 
   const captain = recommendedCaptain(entries);
-  const ownedIds = entries.map((e) => e.player.fpl_id);
-  const transfers = await getBestTransfers(
-    squadGw ?? currentGw?.gw ?? null,
-    ownedIds,
-  );
+  const transfer = bestSquadTransfer(entries, pool);
 
   const recs = await getRecommendations(userId);
   const chipRec = recs.find((r) => r.kind === "chip");
@@ -62,190 +51,119 @@ export default async function DashboardPage() {
     (chipRec?.payload?.["chip"] as string | undefined) ??
     null;
 
-  const starters = entries.filter((e) => !e.on_bench);
-  const bench = entries.filter((e) => e.on_bench);
+  const subtitle =
+    squadGw != null
+      ? `Gameweek ${squadGw}${user.display_name ? ` · ${user.display_name}` : ""}`
+      : "No squad loaded yet";
 
   return (
     <div>
-      <PageHeader
-        title="Your squad"
-        subtitle={
-          squadGw != null
-            ? `Gameweek ${squadGw}${
-                user.display_name ? ` · ${user.display_name}` : ""
-              }`
-            : "No squad loaded yet"
-        }
-      />
+      <PageHeader title="This week" subtitle={subtitle} />
 
-      {/* Recommended captain */}
-      <Card className="mb-4 border-strong">
-        <div className="flex items-center justify-between">
-          <div>
-            <p className="text-xs font-semibold uppercase tracking-wide text-secondary">
-              Recommended captain
-            </p>
-            {captain ? (
-              <p className="mt-0.5 text-lg font-bold text-accent">
-                {captain.player.web_name}{" "}
-                <span className="text-sm font-normal text-secondary">
-                  {captain.team?.short_name ?? ""}
-                </span>
-              </p>
-            ) : (
-              <p className="mt-0.5 text-sm text-secondary">
-                No projections available yet.
-              </p>
-            )}
-          </div>
-          {captain && (
-            <div className="text-right">
-              <div className="text-2xl font-bold text-accent">
-                {formatEp(captain.expected_points)}
-              </div>
-              <div className="text-xs text-secondary">xPts</div>
-            </div>
-          )}
-        </div>
-      </Card>
-
-      {/* Chip note */}
-      <Card className="mb-2 bg-[rgba(245,180,0,0.10)]">
-        <p className="text-xs font-semibold uppercase tracking-wide text-warning">
-          Chip status
-        </p>
-        <p className="mt-0.5 text-sm text-secondary">
-          {chipNote ?? "No chip recommended this week — hold your chips."}
-        </p>
-      </Card>
-
-      {/* Squad */}
       {entries.length === 0 ? (
-        <>
-          <SectionTitle>Squad</SectionTitle>
-          <EmptyState
-            title="No squad loaded yet"
-            hint="Picks are only published by the FPL API after each gameweek deadline. Until then, enter your 15 players manually to get recommendations now."
-          />
-          <Link
-            href="/squad/edit"
-            className="mt-3 inline-flex w-full items-center justify-center rounded-lg bg-accent px-4 py-2.5 font-semibold text-on-accent sm:w-auto"
-          >
-            Pick your squad
-          </Link>
-        </>
-      ) : (
-        <>
-          <div className="flex items-center justify-between">
-            <SectionTitle>Starting XI</SectionTitle>
-            <Link
-              href="/squad/edit"
-              className="text-sm font-medium text-accent hover:underline"
-            >
-              Edit squad
-            </Link>
-          </div>
-          <div className="space-y-1.5">
-            {starters
-              .slice()
-              .sort(sortByEp)
-              .map((e) => (
-                <PlayerRow
-                  key={e.player.fpl_id}
-                  entry={e}
-                  isCaptainRec={
-                    captain?.player.fpl_id === e.player.fpl_id
-                  }
-                />
-              ))}
-          </div>
-
-          {bench.length > 0 && (
-            <>
-              <SectionTitle>Bench</SectionTitle>
-              <div className="space-y-1.5 opacity-70">
-                {bench.slice().sort(sortByEp).map((e) => (
-                  <PlayerRow key={e.player.fpl_id} entry={e} />
-                ))}
-              </div>
-            </>
-          )}
-        </>
-      )}
-
-      {/* Best transfer panel */}
-      <SectionTitle>Best transfer targets</SectionTitle>
-      <p className="mb-2 text-xs text-secondary">
-        Highest projected players by position that you don&apos;t own.
-      </p>
-      {transfers.length === 0 ? (
         <EmptyState
-          title="No suggestions yet"
-          hint="Transfer targets appear once player projections have been computed for the upcoming gameweek."
+          title="No squad to plan yet"
+          hint="Enter your 15 players in the planner to get a suggested captain, best transfer and chip guidance now — before the FPL API publishes your picks."
+          action={
+            <Link href="/squad">
+              <Button>Plan squad</Button>
+            </Link>
+          }
         />
       ) : (
-        <div className="space-y-1.5">
-          {transfers.map((t) => (
-            <Card key={t.player.fpl_id} className="flex items-center justify-between py-3">
-              <div>
-                <div className="flex items-center gap-2">
-                  <Badge tone="purple">{t.position}</Badge>
-                  <span className="font-semibold">{t.player.web_name}</span>
-                  <span className="text-sm text-secondary">
-                    {t.team?.short_name ?? ""}
-                  </span>
-                </div>
-                <div className="mt-0.5 text-xs text-secondary">
-                  {formatPrice(t.player.price)}
-                </div>
-              </div>
-              <div className="text-right">
-                <div className="font-bold text-accent">
-                  {formatEp(t.expected_points)}
-                </div>
-                <div className="text-xs text-secondary">xPts</div>
-              </div>
-            </Card>
-          ))}
+        <div className="space-y-4">
+          <YourXiCard entries={entries} />
+
+          {captain && (
+            <DashboardCaptainCard
+              captain={captain}
+              entries={entries}
+              rationale={captainRationale(captain, pool)}
+            />
+          )}
+
+          {transfer && <DashboardTransferCard projection={transfer} />}
+
+          <ChipWatchCard note={chipNote} />
         </div>
       )}
     </div>
   );
 }
 
-function sortByEp(a: SquadEntry, b: SquadEntry) {
-  return (b.expected_points ?? -Infinity) - (a.expected_points ?? -Infinity);
+// ---- (a) Your XI summary ----
+
+function YourXiCard({ entries }: { entries: SquadEntry[] }) {
+  const summary = squadSummary(entries);
+  const starterCounts: Record<Position, number> = {
+    GK: 0,
+    DEF: 0,
+    MID: 0,
+    FWD: 0,
+  };
+  for (const e of entries) if (!e.on_bench) starterCounts[e.player.position] += 1;
+  const formation =
+    formationFromCounts(starterCounts) ??
+    `${starterCounts.DEF}-${starterCounts.MID}-${starterCounts.FWD}`;
+
+  const meta = `${summary.count} players · ${summary.byPosition.GK} GK · ${summary.byPosition.DEF} DEF · ${summary.byPosition.MID} MID · ${summary.byPosition.FWD} FWD · ${formation}`;
+
+  return (
+    <Card>
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <p className="mb-1 text-xs font-semibold uppercase tracking-wider text-muted">
+            Your XI
+          </p>
+          <div className="flex items-baseline gap-1">
+            <span className="text-2xl font-bold tnum text-primary">
+              {formatPrice(summary.value)}
+            </span>
+            <span className="text-xs font-medium text-muted">squad value</span>
+          </div>
+        </div>
+        <Link
+          href="/squad"
+          className="shrink-0 text-sm font-semibold text-accent hover:underline"
+        >
+          Plan squad →
+        </Link>
+      </div>
+      <p className="mt-2 text-xs text-secondary tnum">{meta}</p>
+    </Card>
+  );
 }
 
-function PlayerRow({
-  entry,
-  isCaptainRec = false,
-}: {
-  entry: SquadEntry;
-  isCaptainRec?: boolean;
-}) {
+// One-line captain rationale, honest about the 1-GW horizon.
+function captainRationale(
+  captain: SquadEntry,
+  pool: { player: { fpl_id: number }; next_fixture: { opponent: { short_name: string } | null; is_home: boolean } | null }[],
+): string {
+  const pe = pool.find((p) => p.player.fpl_id === captain.player.fpl_id);
+  const nf = pe?.next_fixture;
+  const fixture =
+    nf?.opponent?.short_name != null
+      ? ` vs ${nf.opponent.short_name} (${nf.is_home ? "H" : "A"})`
+      : "";
+  return `Highest projected starter in your XI at ${formatEp(
+    captain.expected_points,
+  )} xPts${fixture}. 1-GW projection.`;
+}
+
+// ---- (d) Chip watch ----
+
+function ChipWatchCard({ note }: { note: string | null }) {
   return (
-    <div
-      className={`flex items-center justify-between rounded-lg border bg-surface px-3 py-2 ${
-        isCaptainRec ? "border-accent ring-1 ring-accent" : "border-subtle"
-      }`}
-    >
-      <div className="flex items-center gap-2">
-        <Badge tone="gray">{entry.player.position}</Badge>
-        <span className="font-medium">{entry.player.web_name}</span>
-        <span className="text-sm text-muted">
-          {entry.team?.short_name ?? ""}
-        </span>
-        {entry.is_captain && <Badge tone="purple">C</Badge>}
-        {entry.is_vice && <Badge tone="gray">V</Badge>}
-        {isCaptainRec && <Badge tone="green">Rec. C</Badge>}
+    <Card>
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-xs font-semibold uppercase tracking-wider text-muted">
+          Chip watch
+        </p>
+        <Badge tone="warning">Hold</Badge>
       </div>
-      <div className="text-right">
-        <span className="font-semibold text-accent">
-          {formatEp(entry.expected_points)}
-        </span>
-        <span className="ml-1 text-xs text-muted">xPts</span>
-      </div>
-    </div>
+      <p className="mt-1.5 text-sm text-secondary">
+        {note ?? "No chip recommended this week — hold your chips."}
+      </p>
+    </Card>
   );
 }
