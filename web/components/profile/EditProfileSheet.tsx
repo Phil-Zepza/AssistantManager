@@ -7,14 +7,28 @@ import { saveProfile } from "@/app/actions";
 import { BottomSheet, Button, Callout, Input } from "@/components/ui";
 import type { User } from "@/lib/types";
 
+interface Props {
+  user: User;
+  /**
+   * Controlled mode: when provided the trigger button is hidden and the caller
+   * drives open/close. When omitted the component manages its own state and
+   * renders a "Edit" trigger button (original behaviour).
+   */
+  open?: boolean;
+  onClose?: () => void;
+}
+
 // The "Edit" button on the profile header + the edit subscreen (BottomSheet on
 // mobile, centred dialog on desktop). Editable display name + FPL team ID, with
 // a live validation helper. Save goes through the `saveProfile` server action,
 // which also triggers a squad re-import (a READ from FPL) when the FPL ID
 // changes.
-export default function EditProfileSheet({ user }: { user: User }) {
+export default function EditProfileSheet({ user, open: externalOpen, onClose: externalClose }: Props) {
   const router = useRouter();
-  const [open, setOpen] = useState(false);
+  const isControlled = externalOpen !== undefined;
+
+  const [internalOpen, setInternalOpen] = useState(false);
+  const open = isControlled ? (externalOpen ?? false) : internalOpen;
 
   const storedFplId = user.fpl_entry_id != null ? String(user.fpl_entry_id) : "";
   const [displayName, setDisplayName] = useState(user.display_name ?? "");
@@ -36,7 +50,11 @@ export default function EditProfileSheet({ user }: { user: User }) {
 
   function close() {
     reset();
-    setOpen(false);
+    if (isControlled) {
+      externalClose?.();
+    } else {
+      setInternalOpen(false);
+    }
   }
 
   async function save(e: React.FormEvent) {
@@ -52,7 +70,11 @@ export default function EditProfileSheet({ user }: { user: User }) {
         displayName: displayName.trim() || null,
         fplEntryId: trimmedId === "" ? null : parsedId,
       });
-      setOpen(false);
+      if (isControlled) {
+        externalClose?.();
+      } else {
+        setInternalOpen(false);
+      }
       router.refresh();
     } catch {
       setError("Could not save. Please try again.");
@@ -62,14 +84,16 @@ export default function EditProfileSheet({ user }: { user: User }) {
 
   return (
     <>
-      <Button
-        size="sm"
-        variant="secondary"
-        icon={<Pencil />}
-        onClick={() => setOpen(true)}
-      >
-        Edit
-      </Button>
+      {!isControlled && (
+        <Button
+          size="sm"
+          variant="secondary"
+          icon={<Pencil />}
+          onClick={() => setInternalOpen(true)}
+        >
+          Edit
+        </Button>
+      )}
 
       <BottomSheet open={open} onClose={close} title="Edit profile">
         <form onSubmit={save} className="space-y-4">

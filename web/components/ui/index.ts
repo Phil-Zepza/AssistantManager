@@ -60,3 +60,6 @@ export type {
 
 export { PageHeader } from "./PageHeader";
 export type { PageHeaderProps } from "./PageHeader";
+
+export { Toggle } from "./Toggle";
+export type { ToggleProps } from "./Toggle";
