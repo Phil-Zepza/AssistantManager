@@ -29,7 +29,7 @@ interface NavItem {
 // the avatar popover / rail footer).
 const NAV: NavItem[] = [
   { href: "/", label: "Home", icon: Home, exact: true },
-  { href: "/squad/edit", label: "Squad", icon: Users, match: "/squad" },
+  { href: "/squad", label: "Squad", icon: Users, match: "/squad" },
   { href: "/lms", label: "LMS", icon: Target, match: "/lms" },
   { href: "/history", label: "History", icon: HistoryIcon, match: "/history" },
 ];
