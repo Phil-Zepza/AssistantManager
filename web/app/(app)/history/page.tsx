@@ -1,44 +1,63 @@
 import { redirect } from "next/navigation";
 import { auth } from "@/auth";
-import { getCurrentUser, getRecommendations } from "@/lib/queries";
-import { formatDate } from "@/lib/format";
-import { Badge, Card, EmptyState, PageHeader } from "@/components/ui";
-import type { RecommendationKind, RecommendationLog } from "@/lib/types";
+import { getCurrentUser, getHistoryEntries } from "@/lib/queries";
+import { getCurrentGw } from "@/lib/gameweek";
+import { PageHeader } from "@/components/ui";
+import { HistoryCanvas } from "@/components/history/HistoryCanvas";
+import type { AccuracyStats, HistoryEntry } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 
-const KIND_LABEL: Record<RecommendationKind, string> = {
-  fpl_xi: "Starting XI",
-  fpl_transfer: "Transfer",
-  fpl_captain: "Captain",
-  lms_pick: "LMS pick",
-  chip: "Chip",
-};
-
-// Read a boolean-ish "was this correct" signal from the outcome jsonb.
+// Canonical outcome keys: "hit" (FPL recs) and "survived" (LMS recs).
+// Legacy aliases "correct" / "success" / "won" are intentionally omitted —
+// nothing writes them, and having them in the lookup added ambiguity.
 function isCorrect(outcome: Record<string, unknown> | null): boolean | null {
   if (!outcome) return null;
-  for (const key of ["correct", "hit", "success", "survived", "won"]) {
-    if (key in outcome) {
-      const v = outcome[key];
-      if (typeof v === "boolean") return v;
-      if (typeof v === "string")
-        return ["true", "win", "yes", "correct"].includes(v.toLowerCase());
-    }
-  }
-  if (typeof outcome["result"] === "string") {
-    return (outcome["result"] as string).toLowerCase() === "win";
-  }
+  if ("hit" in outcome && typeof outcome.hit === "boolean") return outcome.hit;
+  if ("survived" in outcome && typeof outcome.survived === "boolean")
+    return outcome.survived;
   return null;
 }
 
-function summarisePayload(payload: Record<string, unknown> | null): string {
-  if (!payload) return "—";
-  for (const key of ["team", "player", "captain", "note", "chip", "summary"]) {
-    if (key in payload && payload[key] != null) return String(payload[key]);
+function computeStats(entries: HistoryEntry[]): AccuracyStats {
+  const resolved = entries.filter((e) => e.outcome !== null);
+  const correct = resolved.filter((e) => isCorrect(e.outcome) === true).length;
+  const hitRate = resolved.length > 0 ? correct / resolved.length : null;
+
+  let trend: number | null = null;
+  if (resolved.length >= 5 && hitRate !== null) {
+    const recent = resolved.slice(0, 5);
+    const recentCorrect = recent.filter(
+      (e) => isCorrect(e.outcome) === true,
+    ).length;
+    trend = recentCorrect / 5 - hitRate;
   }
-  const s = JSON.stringify(payload);
-  return s.length > 80 ? s.slice(0, 77) + "…" : s;
+
+  const byKind: AccuracyStats["byKind"] = {
+    fpl_captain: { correct: 0, resolved: 0 },
+    fpl_transfer: { correct: 0, resolved: 0 },
+    lms_pick: { correct: 0, resolved: 0 },
+  };
+
+  for (const e of resolved) {
+    if (
+      e.kind === "fpl_captain" ||
+      e.kind === "fpl_transfer" ||
+      e.kind === "lms_pick"
+    ) {
+      byKind[e.kind].resolved++;
+      if (isCorrect(e.outcome) === true) byKind[e.kind].correct++;
+    }
+  }
+
+  return {
+    total: entries.length,
+    resolved: resolved.length,
+    correct,
+    hitRate,
+    trend,
+    byKind,
+  };
 }
 
 export default async function HistoryPage() {
@@ -48,82 +67,24 @@ export default async function HistoryPage() {
   const user = await getCurrentUser(userId);
   if (!user) redirect("/login");
 
-  const recs = await getRecommendations(userId);
+  const [entries, currentGwData] = await Promise.all([
+    getHistoryEntries(userId),
+    getCurrentGw(),
+  ]);
 
-  const resolved = recs.filter((r) => r.outcome != null);
-  const correct = resolved.filter((r) => isCorrect(r.outcome) === true).length;
-  const accuracy =
-    resolved.length > 0 ? Math.round((correct / resolved.length) * 100) : null;
+  const stats = computeStats(entries);
 
   return (
     <div>
       <PageHeader
         title="History"
-        subtitle="Past recommendations and how they turned out."
+        subtitle="What we recommended, and how it turned out."
       />
-
-      {/* Accuracy tally */}
-      <div className="mb-4 grid grid-cols-3 gap-2">
-        <Stat label="Logged" value={String(recs.length)} />
-        <Stat label="Resolved" value={String(resolved.length)} />
-        <Stat
-          label="Accuracy"
-          value={accuracy != null ? `${accuracy}%` : "—"}
-        />
-      </div>
-
-      {recs.length === 0 ? (
-        <EmptyState
-          title="No recommendations yet"
-          hint="Once the pipeline runs, each week's captain, transfer, chip and LMS suggestions are logged here with outcomes."
-        />
-      ) : (
-        <div className="space-y-2">
-          {recs.map((r) => (
-            <RecRow key={r.id} rec={r} />
-          ))}
-        </div>
-      )}
+      <HistoryCanvas
+        entries={entries}
+        stats={stats}
+        currentGw={currentGwData?.gw ?? null}
+      />
     </div>
-  );
-}
-
-function Stat({ label, value }: { label: string; value: string }) {
-  return (
-    <Card className="text-center">
-      <div className="text-2xl font-bold text-accent">{value}</div>
-      <div className="text-xs text-secondary">{label}</div>
-    </Card>
-  );
-}
-
-function RecRow({ rec }: { rec: RecommendationLog }) {
-  const correct = isCorrect(rec.outcome);
-  return (
-    <Card className="flex items-center justify-between py-3">
-      <div className="min-w-0">
-        <div className="flex items-center gap-2">
-          <Badge tone="purple">
-            {KIND_LABEL[rec.kind] ?? rec.kind}
-          </Badge>
-          <span className="text-xs text-muted">GW {rec.gw}</span>
-        </div>
-        <p className="mt-1 truncate text-sm font-medium text-primary">
-          {summarisePayload(rec.payload)}
-        </p>
-        <p className="text-xs text-muted">{formatDate(rec.created_at)}</p>
-      </div>
-      <div className="ml-3 shrink-0">
-        {rec.outcome == null ? (
-          <Badge tone="amber">Pending</Badge>
-        ) : correct === true ? (
-          <Badge tone="green">Hit ✓</Badge>
-        ) : correct === false ? (
-          <Badge tone="red">Miss ✗</Badge>
-        ) : (
-          <Badge tone="gray">Resolved</Badge>
-        )}
-      </div>
-    </Card>
   );
 }

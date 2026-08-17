@@ -2,6 +2,7 @@ import { q } from "./db";
 import type {
   Fixture,
   Gameweek,
+  HistoryEntry,
   LmsFixtureOption,
   LmsPick,
   ModelFixtureProbs,
@@ -384,6 +385,26 @@ export async function getRecommendations(
        where user_id = $1
        order by created_at desc
        limit 200`,
+    [userId],
+  );
+}
+
+// Extended history query — joins players/teams so the UI can render
+// "Captain Salah" / "Pick Arsenal (72%)" without raw IDs.
+export async function getHistoryEntries(
+  userId: number,
+): Promise<HistoryEntry[]> {
+  return q<HistoryEntry>(
+    `select r.*,
+       p.web_name      as player_name,
+       t.name          as team_name,
+       t.short_name    as team_short_name
+     from recommendations_log r
+     left join players p on p.fpl_id = (r.payload->>'player_id')::int
+     left join teams   t on t.fpl_id = (r.payload->>'team_id')::int
+     where r.user_id = $1
+     order by r.gw desc, r.created_at desc
+     limit 200`,
     [userId],
   );
 }

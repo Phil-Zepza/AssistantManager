@@ -244,3 +244,34 @@ export interface LmsForwardRound {
 }
 
 export type LmsForwardPlan = LmsForwardRound[];
+
+// ---- History ----
+
+// Canonical outcome shapes for recommendations_log.outcome jsonb.
+// The pipeline back-fill MUST write exactly one of these two — NOT "correct" / "success" / "won".
+// FPL recs (fpl_captain, fpl_transfer):  { hit: boolean; actual_points?: number }
+// LMS recs (lms_pick):                   { survived: boolean; result: "win" | "draw" | "loss" }
+export type CanonicalOutcome =
+  | { hit: boolean; actual_points?: number }
+  | { survived: boolean; result: "win" | "draw" | "loss" };
+
+// RecommendationLog joined with player/team display names for the /history page.
+export interface HistoryEntry extends RecommendationLog {
+  player_name: string | null;     // players.web_name for fpl_captain / fpl_transfer
+  team_name: string | null;       // teams.name for lms_pick
+  team_short_name: string | null; // teams.short_name (3-letter code for ClubBadge)
+}
+
+// Accuracy stats computed server-side from HistoryEntry[].
+export interface AccuracyStats {
+  total: number;
+  resolved: number;
+  correct: number;
+  hitRate: number | null;  // 0–1; null when resolved === 0
+  trend: number | null;    // (recent-5 rate) − (overall rate); null when resolved < 5
+  byKind: {
+    fpl_captain: { correct: number; resolved: number };
+    fpl_transfer: { correct: number; resolved: number };
+    lms_pick: { correct: number; resolved: number };
+  };
+}
