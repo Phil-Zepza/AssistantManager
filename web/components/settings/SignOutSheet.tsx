@@ -11,7 +11,7 @@ interface Props {
 
 export function SignOutSheet({ open, onClose }: Props) {
   return (
-    <BottomSheet open={open} onClose={onClose} title="Sign out of PUSB?">
+    <BottomSheet open={open} onClose={onClose} title="Sign out of AI Gaffer?">
       <div className="space-y-4">
         <Callout tone="info">
           Your squad and LMS picks stay saved.

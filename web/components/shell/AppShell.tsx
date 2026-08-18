@@ -45,7 +45,7 @@ function contextualTitle(pathname: string): string {
   if (pathname.startsWith("/lms")) return "LMS";
   if (pathname.startsWith("/history")) return "History";
   if (pathname.startsWith("/settings")) return "Settings";
-  return "FPL / LMS";
+  return "AI Gaffer";
 }
 
 export interface AppShellProps {
@@ -63,19 +63,13 @@ export function AppShell({ children, userEmail, gw, deadline }: AppShellProps) {
     <div className="min-h-screen">
       {/* Desktop left rail */}
       <aside className="fixed inset-y-0 left-0 z-30 hidden w-[232px] flex-col border-r border-subtle bg-raised md:flex">
-        <div className="flex items-center gap-2 px-5 py-5">
-          <span className="grid h-8 w-8 place-items-center rounded-lg bg-accent text-sm font-black text-on-accent">
-            P
+        <Link href="/" className="flex items-center gap-2.5 px-5 py-5">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img src="/logo/mark.svg" alt="" className="h-8 w-auto" />
+          <span className="text-sm font-extrabold tracking-tight text-primary">
+            AI Gaffer
           </span>
-          <span className="leading-tight">
-            <span className="block text-sm font-extrabold tracking-tight text-primary">
-              PUSB
-            </span>
-            <span className="block text-[11px] font-medium text-muted">
-              FPL + LMS
-            </span>
-          </span>
-        </div>
+        </Link>
 
         <nav className="flex-1 space-y-1 px-3 py-2">
           {NAV.map((item) => (
