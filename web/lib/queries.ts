@@ -783,23 +783,42 @@ export async function getTeamScouting(
   const ids = [...new Set(teamIds.filter((id) => Number.isInteger(id)))];
   if (ids.length === 0) return [];
 
+  type StatRow = {
+    team_id: number;
+    web_name: string;
+    season: string;
+    is_current: boolean;
+    minutes: number | null;
+    goals: number | null;
+    xg: number | null;
+  };
+
   const [statRows, resultRows] = await Promise.all([
-    q<{
-      team_id: number;
-      web_name: string;
-      season: string;
-      is_current: boolean;
-      minutes: number | null;
-      goals: number | null;
-      xg: number | null;
-    }>(
+    // player_season_stats is a planned table (see
+    // db/migrations/002_player_season_stats.sql) that is not yet provisioned on
+    // every environment, and preseason it has no rows anyway. If it's absent we
+    // degrade the scouting block to form-only rather than 500 the whole detail
+    // page — recent form below comes from `fixtures`, which always exists.
+    q<StatRow>(
       `select p.team_id, p.web_name, s.season, s.is_current,
               s.minutes, s.goals, s.xg
          from players p
          join player_season_stats s on s.player_id = p.fpl_id
         where p.team_id = any($1::int[])`,
       [ids],
-    ),
+    ).catch((err: unknown): StatRow[] => {
+      const code = (err as { code?: string } | null)?.code;
+      // 42P01 undefined_table, 42703 undefined_column — the season-stats
+      // source isn't there. Any other error is a real fault; rethrow it.
+      if (code === "42P01" || code === "42703") {
+        console.warn(
+          "[scouting] player_season_stats unavailable — degrading to form-only:",
+          code,
+        );
+        return [];
+      }
+      throw err;
+    }),
     q<{
       home_team: number | null;
       away_team: number | null;
