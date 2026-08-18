@@ -1,32 +1,56 @@
 # Development Workflow
 
 ## Roles
-- **Cowork (Claude, chat):** orchestrator/architect. Writes the Claude Code prompts (with a
-  recommended model + thinking level), reviews Claude Code's output, keeps these docs updated.
-  Does not edit app code directly.
-- **Claude Code (local, in this repo):** makes the code changes.
-- **Phil:** runs Claude Code, reviews the `staging` deployment, cuts releases.
+- **Claude Code (local, in this repo):** makes the code changes, runs builds, opens PRs.
+- **Phil:** reviews PRs, merges to `staging`, cuts releases to `main`.
 
-## Git flow (IMPORTANT)
-- **Claude Code commits directly to `staging` and pushes** — no per-task feature branch, no PR.
-  Each task ends: make the change on `staging` → commit → `git push origin staging`. Vercel
-  builds the `staging` preview automatically.
-- **`staging` → `main` is the release step, and it's Phil's call.** Merging `staging` into
-  `main` promotes to production; Claude Code does not merge to `main` or deploy production.
-- `main` stays releasable. Keep each `staging` commit self-contained and green
-  (`npm run build`, `py_compile`) so `staging` is always previewable.
+## Git flow (MANDATORY)
 
-> This retires the older feature-branch → PR-into-`staging` flow. Direct-to-`staging` is the
-> current convention; the PR gate now sits at `staging` → `main` (release), which Phil owns.
+> This section supersedes all previous guidance. The old "direct-to-`staging`" convention
+> is retired. Feature branches + PRs are now required for every task.
+
+### Starting a task
+1. Fetch and branch off `staging`:
+
+   ```bash
+   git fetch origin staging
+   git checkout -b feat/<short-slug> origin/staging
+   # or fix/<short-slug> / chore/<short-slug> as appropriate
+   ```
+
+2. Make all changes on that branch. **Never commit directly to `staging` or `main`.**
+
+### Finishing a task
+1. Run `npm run build` (from `web/`) — it must pass cleanly.
+2. Commit and push:
+
+   ```bash
+   git add <files>
+   git commit -m "feat: ..."
+   git push -u origin feat/<short-slug>
+   ```
+
+3. Open a Pull Request into `staging` on GitHub.
+4. **Stop. Do not merge the PR.** Phil reviews and merges.
+
+### Deployments
+- `staging` is the only branch that deploys (after Phil merges a PR into it).
+- Vercel preview deployments per branch are **disabled** — do not rely on per-branch preview URLs.
+- `staging` → `main` (production release) is Phil's decision and action.
 
 ## Claude Code prompt format
-Header: **Model** (Opus for architecture / gnarly debugging; Sonnet for routine) ·
-**Thinking** (think / think hard / think harder / ultrathink). Then a self-contained prompt:
-context, the change, constraints (keep patterns intact), verification (`npm run build`, `py_compile`),
-and the commit-directly-to-`staging`-and-push instruction.
+
+Header: **Model** (Opus for architecture/gnarly debugging; Sonnet for routine tasks) ·
+**Thinking** (`think` / `think hard` / `think harder` / `ultrathink`).
+
+Then a self-contained prompt covering: context, the change required, constraints (keep existing
+patterns intact), build verification (`npm run build`), and the branch/PR instruction.
 
 ## Where things live
-- **Prompts + task log:** `docs/claude-code-tasks.md` (append every task here).
-- **Roadmap / streams:** `docs/roadmap.md`.
-- **Project log (setup + fixes):** `docs/project-log.md`.
-- **Strategy / product / architecture record:** the claude.ai Project ("FPL / LMS") docs.
+
+| Path | Purpose |
+|---|---|
+| `docs/claude-code-tasks.md` | Append every task prompt + outcome here |
+| `docs/roadmap.md` | Feature roadmap and work streams |
+| `docs/project-log.md` | Setup notes and significant fixes |
+| `CLAUDE.md` | Mandatory rules for Claude Code (source of truth) |
