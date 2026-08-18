@@ -470,3 +470,394 @@ export function computeForwardPlan(input: ComputeForwardPlanInput): ForwardPlan 
 
   return { picks, reserves };
 }
+
+// ============================================================================
+// Cross-entry variance — "Spread picks across entries" (computeCompetitionPlan)
+// ============================================================================
+//
+// A competition holds multiple entries (lives). Backing the same team in the same
+// round across entries means one freak result can eliminate them all at once.
+// computeCompetitionPlan allocates JOINTLY across the alive entries per qualifying
+// round so each entry gets a distinct team where possible. It COMPOSES with the
+// per-entry engine above: `off` mode (and every sub-7 round, and each entry's
+// reserves output) is delegated straight to computeForwardPlan, so PR A behaviour
+// is reproduced exactly; the soft/strong coordination only changes WHICH team each
+// entry is handed per qualifying round. Each entry's own used-teams + reserves
+// still gate its candidate pool.
+//
+// Pure + side-effect free (same inputs -> same output), so PR D can re-run it in
+// the browser on every override. Nothing persists until submitPick locks a round.
+
+export type SpreadMode = "off" | "soft" | "strong";
+export type SpreadSource = "spread" | "matched" | null;
+
+/**
+ * Auto-Soft default: adding an entry that takes a competition from 1 -> 2 entries
+ * flips an untouched ('off') competition to 'soft'. Pure so actions.ts and its test
+ * share one rule. Never lowers an explicit 'soft'/'strong' choice, and fires only at
+ * exactly 2 entries — so re-running at 3+ entries is a no-op (idempotent).
+ */
+export function autoSoftApplies(
+  entryCountAfterInsert: number,
+  currentMode: SpreadMode,
+): boolean {
+  return entryCountAfterInsert === 2 && currentMode === "off";
+}
+
+/** A per-round "same team across entries" override (lms_competition_spread_overrides). */
+export interface SpreadOverride {
+  gw: number;
+  forceSame: boolean;
+}
+
+/** One alive entry's planner state for the joint pass. */
+export interface CompetitionEntryInput {
+  entryId: number;
+  entryState: PlannerEntryState;
+  /** Provisional future-round overrides; honoured only via the off-mode delegation. */
+  pins?: PlannerPin[];
+}
+
+export interface ComputeCompetitionPlanInput {
+  /** All ALIVE entries. Ordered deterministically by entryId inside the engine. */
+  entries: CompetitionEntryInput[];
+  upcomingRounds: PlannerRound[];
+  fixtureProbs: PlannerFixtureProb[];
+  teams: PlannerTeam[];
+  eliteSet: number[];
+  spreadMode: SpreadMode;
+  /** Competition Soft floor (default 0.65). Used per entry when its own floor is not finite. */
+  spreadFloorSoft: number;
+  overrides?: SpreadOverride[];
+}
+
+export interface SpreadPlannedPick extends PlannedPick {
+  entryId: number;
+  spreadSource: SpreadSource;
+}
+
+export interface CompetitionEntryPlan {
+  entryId: number;
+  picks: SpreadPlannedPick[];
+  /** Reserves come from the per-entry engine (spread never reshapes reserves). */
+  reserves: PlannedReserve[];
+}
+
+export interface CompetitionPlan {
+  entries: CompetitionEntryPlan[];
+  /** GWs the Soft pass auto-collapsed — the caller persists these as force_same overrides. */
+  autoCollapsedGws: number[];
+}
+
+export function computeCompetitionPlan(
+  input: ComputeCompetitionPlanInput,
+): CompetitionPlan {
+  const { spreadMode, teams } = input;
+
+  const teamById = new Map<number, PlannerTeam>();
+  for (const t of teams) teamById.set(t.id, t);
+  const eloOf = (id: number): number => teamById.get(id)?.elo ?? -Infinity;
+  const shortOf = (id: number): string => teamById.get(id)?.shortName ?? `#${id}`;
+  const pct = (p: number): string => `${Math.round(p * 100)}%`;
+
+  // Per-gw best outright win prob per team — identical construction to
+  // computeForwardPlan (double GW keeps the higher-probability fixture).
+  const winByGw = new Map<number, Map<number, TeamWin>>();
+  const addWin = (
+    gw: number,
+    teamId: number,
+    pWin: number | null,
+    isHome: boolean,
+    fixtureId: number,
+  ): void => {
+    if (pWin == null) return;
+    let inner = winByGw.get(gw);
+    if (!inner) {
+      inner = new Map();
+      winByGw.set(gw, inner);
+    }
+    const prev = inner.get(teamId);
+    if (!prev || pWin > prev.pWin) inner.set(teamId, { pWin, isHome, fixtureId });
+  };
+  for (const fp of input.fixtureProbs) {
+    addWin(fp.gw, fp.homeTeamId, fp.pHome, true, fp.fixtureId);
+    addWin(fp.gw, fp.awayTeamId, fp.pAway, false, fp.fixtureId);
+  }
+
+  const rank = (
+    gw: number,
+    ok: (teamId: number) => boolean,
+  ): Array<{ teamId: number; win: TeamWin }> => {
+    const inner = winByGw.get(gw);
+    if (!inner) return [];
+    const arr: Array<{ teamId: number; win: TeamWin }> = [];
+    for (const [teamId, win] of inner) if (ok(teamId)) arr.push({ teamId, win });
+    arr.sort(
+      (a, b) =>
+        b.win.pWin - a.win.pWin ||
+        eloOf(b.teamId) - eloOf(a.teamId) ||
+        a.teamId - b.teamId,
+    );
+    return arr;
+  };
+
+  const rounds = [...input.upcomingRounds].sort((a, b) => a.gw - b.gw);
+  const overrideByGw = new Map<number, boolean>();
+  for (const o of input.overrides ?? []) overrideByGw.set(o.gw, o.forceSame);
+
+  // Deterministic entry order (created order == ascending id).
+  const entries = [...input.entries].sort((a, b) => a.entryId - b.entryId);
+
+  // Per-entry PR A plan — the source of truth for off-mode picks, sub-7 skip rows
+  // and reserves. Also used as the pure-safest reference only for off mode.
+  const basePlanByEntry = new Map<number, ForwardPlan>();
+  for (const e of entries) {
+    basePlanByEntry.set(
+      e.entryId,
+      computeForwardPlan({
+        entryState: e.entryState,
+        upcomingRounds: input.upcomingRounds,
+        fixtureProbs: input.fixtureProbs,
+        teams,
+        eliteSet: input.eliteSet,
+        pins: e.pins,
+      }),
+    );
+  }
+  const basePickAt = (entryId: number, gw: number): PlannedPick | undefined => {
+    for (const p of basePlanByEntry.get(entryId)!.picks) if (p.gw === gw) return p;
+    return undefined;
+  };
+
+  // Fast path: off + no active override => straight PR A passthrough.
+  const hasForceSame = (input.overrides ?? []).some((o) => o.forceSame);
+  if (spreadMode === "off" && !hasForceSame) {
+    return {
+      entries: entries.map((e) => ({
+        entryId: e.entryId,
+        picks: basePlanByEntry.get(e.entryId)!.picks.map((p) => ({
+          ...p,
+          entryId: e.entryId,
+          spreadSource: null as SpreadSource,
+        })),
+        reserves: basePlanByEntry.get(e.entryId)!.reserves,
+      })),
+      autoCollapsedGws: [],
+    };
+  }
+
+  // ---- Coordinated sweep state ----
+  const allocatedByEntry = new Map<number, Set<number>>(); // single-use across the plan
+  const reservedByEntry = new Map<number, Set<number>>(); // manual reserves only (mirrors PR A)
+  const floorByEntry = new Map<number, number>();
+  const picksByEntry = new Map<number, SpreadPlannedPick[]>();
+  for (const e of entries) {
+    allocatedByEntry.set(e.entryId, new Set(e.entryState.usedTeamIds));
+    reservedByEntry.set(
+      e.entryId,
+      new Set(e.entryState.strategy === "manual" ? e.entryState.reservedTeamIds : []),
+    );
+    const cf = e.entryState.confidenceFloor;
+    floorByEntry.set(e.entryId, Number.isFinite(cf) ? cf : input.spreadFloorSoft);
+    picksByEntry.set(e.entryId, []);
+  }
+
+  const candidatesFor = (
+    entryId: number,
+    gw: number,
+  ): Array<{ teamId: number; win: TeamWin }> =>
+    rank(
+      gw,
+      (id) =>
+        !allocatedByEntry.get(entryId)!.has(id) &&
+        !reservedByEntry.get(entryId)!.has(id),
+    );
+
+  // Emit one pick for an entry, deriving flags/reason consistently with PR A.
+  const emit = (
+    entryId: number,
+    gw: number,
+    teamId: number | null,
+    spreadSource: SpreadSource,
+    lead: string, // reason lead-in, e.g. "distinct side to spread risk"
+  ): void => {
+    if (teamId != null) allocatedByEntry.get(entryId)!.add(teamId);
+    const win = teamId != null ? winByGw.get(gw)?.get(teamId) : undefined;
+    const pWin = win?.pWin ?? null;
+    const floor = floorByEntry.get(entryId)!;
+    const flags: PlanFlag[] = [];
+    if (teamId == null) flags.push("noPick");
+    else if (pWin != null && pWin < floor) flags.push("needsDeploy");
+    const reason =
+      teamId == null
+        ? "no available side plays this round"
+        : `${lead} — ${shortOf(teamId)} (${win?.isHome ? "H" : "A"}${
+            pWin != null ? `, ${pct(pWin)}` : ""
+          })`;
+    picksByEntry
+      .get(entryId)!
+      .push({ gw, teamId, pWin, reason, flags, entryId, spreadSource });
+  };
+
+  // Collapse a round: every alive entry backs one team (tagged matched). `preferred`
+  // is the intended team (Soft's single floor-clearer); otherwise pick the safest
+  // team available to EVERY alive entry. An entry that cannot use the common team
+  // (already used it) falls back to its own safest, still tagged matched.
+  const collapseRound = (gw: number, preferred?: number): void => {
+    const availableToAll = (id: number): boolean =>
+      entries.every(
+        (e) =>
+          !allocatedByEntry.get(e.entryId)!.has(id) &&
+          !reservedByEntry.get(e.entryId)!.has(id),
+      );
+    let chosen: number | null = null;
+    if (
+      preferred != null &&
+      (winByGw.get(gw)?.has(preferred) ?? false) &&
+      availableToAll(preferred)
+    ) {
+      chosen = preferred;
+    } else {
+      for (const c of rank(gw, () => true)) {
+        if (availableToAll(c.teamId)) {
+          chosen = c.teamId;
+          break;
+        }
+      }
+    }
+    for (const e of entries) {
+      if (
+        chosen != null &&
+        !allocatedByEntry.get(e.entryId)!.has(chosen) &&
+        !reservedByEntry.get(e.entryId)!.has(chosen)
+      ) {
+        emit(e.entryId, gw, chosen, "matched", "same team across entries");
+      } else {
+        const solo = candidatesFor(e.entryId, gw)[0];
+        emit(
+          e.entryId,
+          gw,
+          solo?.teamId ?? null,
+          solo ? "matched" : null,
+          "same team across entries (own safest — common team unavailable)",
+        );
+      }
+    }
+  };
+
+  // Greedy distinct allocation for one round. `useFloor` gates Soft to floor-clearing
+  // candidates; Strong hands out the next-best distinct candidate however low.
+  const allocateDistinct = (gw: number, useFloor: boolean): void => {
+    const assigned = new Set<number>();
+    for (const e of entries) {
+      const floor = floorByEntry.get(e.entryId)!;
+      const cands = candidatesFor(e.entryId, gw);
+      const solo = cands[0]; // the entry's own pure-safest this round
+      let pick: { teamId: number; win: TeamWin } | undefined;
+      for (const c of cands) {
+        if (assigned.has(c.teamId)) continue;
+        if (useFloor && c.win.pWin < floor) continue;
+        pick = c;
+        break;
+      }
+      if (pick) {
+        assigned.add(pick.teamId);
+        const source: SpreadSource =
+          solo && pick.teamId !== solo.teamId ? "spread" : null;
+        emit(
+          e.entryId,
+          gw,
+          pick.teamId,
+          source,
+          source === "spread" ? "distinct side to spread risk" : "safest available side",
+        );
+      } else if (solo) {
+        // No distinct (floor-clearing) candidate left — take own safest, matched.
+        assigned.add(solo.teamId);
+        emit(e.entryId, gw, solo.teamId, "matched", "matched sibling — no distinct side");
+      } else {
+        emit(e.entryId, gw, null, null, "");
+      }
+    }
+  };
+
+  const skippedSpread = (entryId: number, gw: number): void => {
+    const base = basePickAt(entryId, gw);
+    picksByEntry.get(entryId)!.push({
+      gw,
+      teamId: null,
+      pWin: null,
+      reason: base?.reason ?? "under 7 fixtures — does not count for LMS",
+      flags: base?.flags ?? (["skipped"] as PlanFlag[]),
+      entryId,
+      spreadSource: null,
+    });
+  };
+
+  const autoCollapsedGws: number[] = [];
+
+  for (const r of rounds) {
+    if (!r.lmsEligible) {
+      for (const e of entries) skippedSpread(e.entryId, r.gw);
+      continue;
+    }
+    const gw = r.gw;
+
+    // Per-round force_same override collapses regardless of mode.
+    if (overrideByGw.get(gw) === true) {
+      collapseRound(gw);
+      continue;
+    }
+
+    if (spreadMode === "off") {
+      // Non-override off round: follow each entry's PR A pick verbatim.
+      for (const e of entries) {
+        const base = basePickAt(e.entryId, gw);
+        if (base?.teamId != null) allocatedByEntry.get(e.entryId)!.add(base.teamId);
+        picksByEntry.get(e.entryId)!.push({
+          ...(base ?? {
+            gw,
+            teamId: null,
+            pWin: null,
+            reason: "no available side plays this round",
+            flags: ["noPick"] as PlanFlag[],
+          }),
+          entryId: e.entryId,
+          spreadSource: null,
+        });
+      }
+      continue;
+    }
+
+    if (spreadMode === "soft") {
+      // Union of teams that clear each entry's floor and are available to it.
+      const floorTeams = new Set<number>();
+      for (const e of entries) {
+        const floor = floorByEntry.get(e.entryId)!;
+        for (const c of candidatesFor(e.entryId, gw)) {
+          if (c.win.pWin >= floor) floorTeams.add(c.teamId);
+        }
+      }
+      if (floorTeams.size === 1) {
+        // Only one team clears the floor for the whole set — auto-collapse.
+        collapseRound(gw, [...floorTeams][0]);
+        autoCollapsedGws.push(gw);
+        continue;
+      }
+      allocateDistinct(gw, true);
+      continue;
+    }
+
+    // strong
+    allocateDistinct(gw, false);
+  }
+
+  return {
+    entries: entries.map((e) => ({
+      entryId: e.entryId,
+      picks: picksByEntry.get(e.entryId)!,
+      reserves: basePlanByEntry.get(e.entryId)!.reserves,
+    })),
+    autoCollapsedGws,
+  };
+}

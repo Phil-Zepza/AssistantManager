@@ -8,11 +8,14 @@ import type {
   LmsEntryDetail,
   LmsEntryPickView,
   LmsEntryStatus,
+  LmsCompetitionSpreadView,
   LmsFixtureOption,
   LmsGameweekFixture,
   LmsPick,
   LmsPickResult,
   LmsReserveStrategy,
+  LmsSpreadMode,
+  LmsSpreadSource,
   LmsTeamOption,
   ModelFixtureProbs,
   PickPoolEntry,
@@ -28,12 +31,15 @@ import type {
   User,
 } from "./types";
 import {
+  computeCompetitionPlan,
   computeDefaultDeadline,
   computeEliteSet,
+  type CompetitionEntryInput,
   type PlannerEntryState,
   type PlannerFixtureProb,
   type PlannerRound,
   type PlannerTeam,
+  type SpreadOverride,
 } from "./lmsPlanner";
 
 const POSITIONS: Position[] = ["GK", "DEF", "MID", "FWD"];
@@ -524,8 +530,10 @@ export async function getCompetition(
     name: string;
     start_gw: number;
     notes: string | null;
+    spread_mode: LmsSpreadMode;
+    spread_floor_soft: string; // numeric — coerce with Number()
   }>(
-    `select id, user_id, name, start_gw, notes
+    `select id, user_id, name, start_gw, notes, spread_mode, spread_floor_soft
        from lms_competitions where id = $1 and user_id = $2`,
     [id, userId],
   );
@@ -560,6 +568,8 @@ export async function getCompetition(
       strategy: e.reserve_strategy,
       picksCount: Number(e.picks_count),
     })),
+    spreadMode: c.spread_mode,
+    spreadFloorSoft: Number(c.spread_floor_soft),
   };
 }
 
@@ -594,9 +604,11 @@ export async function getEntry(
       team_id: number;
       result: LmsPickResult;
       is_backfill: boolean;
+      spread_source: LmsSpreadSource;
       team: Team | null;
     }>(
-      `select p.gw, p.team_id, p.result, p.is_backfill, to_jsonb(t.*) as team
+      `select p.gw, p.team_id, p.result, p.is_backfill, p.spread_source,
+              to_jsonb(t.*) as team
          from lms_entry_picks p
          left join teams t on t.fpl_id = p.team_id
         where p.entry_id = $1 order by p.gw asc`,
@@ -619,6 +631,7 @@ export async function getEntry(
     team: p.team,
     result: p.result,
     isBackfill: p.is_backfill,
+    spreadSource: p.spread_source,
   }));
 
   const teamOptions: LmsTeamOption[] = teams.map((t) => {
@@ -680,72 +693,44 @@ export async function getGameweekFixtures(
   }));
 }
 
-// The bundle of inputs the pure planner (lib/lmsPlanner.ts) needs. Assembled
-// server-side; the client calls computeForwardPlan() with this (+ any pins) and
-// recomputes live on every override — nothing here is persisted.
-export interface ForwardPlanInputs {
-  entryState: PlannerEntryState;
+// The competition-global slice of the planner inputs: teams, upcoming rounds and
+// fixture win-probabilities from `startGw`, plus the elo-derived elite set. Shared
+// by getForwardPlanInputs and getCompetitionSpreadView (identical for every entry
+// in a competition — same fixtures). `startGw` is the competition's start_gw.
+interface CompetitionGlobals {
+  teams: PlannerTeam[];
   upcomingRounds: PlannerRound[];
   fixtureProbs: PlannerFixtureProb[];
-  teams: PlannerTeam[];
   eliteSet: number[];
 }
 
-export async function getForwardPlanInputs(
-  entryId: number,
-  userId: number,
-): Promise<ForwardPlanInputs | null> {
-  const entryRows = await q<{
-    id: number;
-    start_gw: number;
-    reserve_strategy: LmsReserveStrategy;
-    confidence_floor: string;
-  }>(
-    `select e.id, c.start_gw, e.reserve_strategy, e.confidence_floor
-       from lms_entries e
-       join lms_competitions c on c.id = e.competition_id
-      where e.id = $1 and c.user_id = $2`,
-    [entryId, userId],
-  );
-  const e = entryRows[0];
-  if (!e) return null;
-
-  const [usedRows, reserveRows, teamsRows, roundRows, probRows] =
-    await Promise.all([
-      q<{ team_id: number }>(
-        `select team_id from lms_entry_picks where entry_id = $1`,
-        [entryId],
-      ),
-      q<{ team_id: number }>(
-        `select team_id from lms_entry_reserves where entry_id = $1`,
-        [entryId],
-      ),
-      getAllTeams(),
-      q<{ gw: number; lms_eligible: boolean; num_fixtures: number | null }>(
-        `select gw, lms_eligible, num_fixtures from gameweeks
-          where finished = false and gw >= $1 order by gw asc`,
-        [e.start_gw],
-      ),
-      q<{
-        fixture_id: number;
-        gw: number | null;
-        home_team: number | null;
-        away_team: number | null;
-        p_home: number | null;
-        p_draw: number | null;
-        p_away: number | null;
-      }>(
-        `select f.fpl_id as fixture_id, f.gw, f.home_team, f.away_team,
-                mp.p_home, mp.p_draw, mp.p_away
-           from fixtures f
-           join model_fixture_probs mp on mp.fixture_id = f.fpl_id
-          where f.finished = false and f.gw >= $1`,
-        [e.start_gw],
-      ),
-    ]);
+async function getCompetitionGlobals(startGw: number): Promise<CompetitionGlobals> {
+  const [teamsRows, roundRows, probRows] = await Promise.all([
+    getAllTeams(),
+    q<{ gw: number; lms_eligible: boolean; num_fixtures: number | null }>(
+      `select gw, lms_eligible, num_fixtures from gameweeks
+        where finished = false and gw >= $1 order by gw asc`,
+      [startGw],
+    ),
+    q<{
+      fixture_id: number;
+      gw: number | null;
+      home_team: number | null;
+      away_team: number | null;
+      p_home: number | null;
+      p_draw: number | null;
+      p_away: number | null;
+    }>(
+      `select f.fpl_id as fixture_id, f.gw, f.home_team, f.away_team,
+              mp.p_home, mp.p_draw, mp.p_away
+         from fixtures f
+         join model_fixture_probs mp on mp.fixture_id = f.fpl_id
+        where f.finished = false and f.gw >= $1`,
+      [startGw],
+    ),
+  ]);
 
   const teams: PlannerTeam[] = teamsRows.map(toPlannerTeam);
-
   const fixtureProbs: PlannerFixtureProb[] = probRows
     .filter((r) => r.gw != null && r.home_team != null && r.away_team != null)
     .map((r) => ({
@@ -759,20 +744,269 @@ export async function getForwardPlanInputs(
     }));
 
   return {
-    entryState: {
-      usedTeamIds: usedRows.map((u) => u.team_id),
-      reservedTeamIds: reserveRows.map((r) => r.team_id),
-      strategy: e.reserve_strategy,
-      confidenceFloor: Number(e.confidence_floor),
-    },
+    teams,
     upcomingRounds: roundRows.map((r) => ({
       gw: r.gw,
       lmsEligible: r.lms_eligible,
       numFixtures: r.num_fixtures,
     })),
     fixtureProbs,
-    teams,
     eliteSet: computeEliteSet(teams),
+  };
+}
+
+// One alive entry's planner state + display label, for the joint spread pass.
+export interface AliveEntryInput extends CompetitionEntryInput {
+  label: string;
+  status: LmsEntryStatus;
+}
+
+// Every ALIVE entry's used-teams + reserves + strategy + floor for a competition,
+// in deterministic (ascending id) order. The spread pass needs all siblings at once.
+async function getAliveEntryInputs(
+  competitionId: number,
+): Promise<AliveEntryInput[]> {
+  const entryRows = await q<{
+    id: number;
+    label: string;
+    status: LmsEntryStatus;
+    reserve_strategy: LmsReserveStrategy;
+    confidence_floor: string;
+  }>(
+    `select id, label, status, reserve_strategy, confidence_floor
+       from lms_entries
+      where competition_id = $1 and status = 'alive'
+      order by id asc`,
+    [competitionId],
+  );
+  if (entryRows.length === 0) return [];
+
+  const ids = entryRows.map((e) => e.id);
+  const [usedRows, reserveRows] = await Promise.all([
+    q<{ entry_id: number; team_id: number }>(
+      `select entry_id, team_id from lms_entry_picks where entry_id = any($1::int[])`,
+      [ids],
+    ),
+    q<{ entry_id: number; team_id: number }>(
+      `select entry_id, team_id from lms_entry_reserves where entry_id = any($1::int[])`,
+      [ids],
+    ),
+  ]);
+  const groupByEntry = (rows: { entry_id: number; team_id: number }[]) => {
+    const m = new Map<number, number[]>();
+    for (const r of rows) {
+      const list = m.get(r.entry_id);
+      if (list) list.push(r.team_id);
+      else m.set(r.entry_id, [r.team_id]);
+    }
+    return m;
+  };
+  const usedByEntry = groupByEntry(usedRows);
+  const reservedByEntry = groupByEntry(reserveRows);
+
+  return entryRows.map((e) => ({
+    entryId: e.id,
+    label: e.label,
+    status: e.status,
+    entryState: {
+      usedTeamIds: usedByEntry.get(e.id) ?? [],
+      reservedTeamIds: reservedByEntry.get(e.id) ?? [],
+      strategy: e.reserve_strategy,
+      confidenceFloor: Number(e.confidence_floor),
+    },
+  }));
+}
+
+// Per-round force_same overrides for a competition (only rows with force_same=true).
+async function getSpreadOverrides(
+  competitionId: number,
+): Promise<SpreadOverride[]> {
+  const rows = await q<{ gw: number; force_same: boolean }>(
+    `select gw, force_same from lms_competition_spread_overrides
+      where competition_id = $1`,
+    [competitionId],
+  );
+  return rows.map((r) => ({ gw: r.gw, forceSame: r.force_same }));
+}
+
+// The bundle of inputs the pure planner (lib/lmsPlanner.ts) needs. Assembled
+// server-side; the client calls computeForwardPlan() with this (+ any pins) and
+// recomputes live on every override — nothing here is persisted.
+//
+// The `entryState` + base fields drive the per-entry computeForwardPlan; the
+// spread fields (spreadMode/spreadFloorSoft/spreadOverrides + aliveEntries — every
+// alive sibling's planner state) drive computeCompetitionPlan.
+export interface ForwardPlanInputs {
+  entryState: PlannerEntryState;
+  upcomingRounds: PlannerRound[];
+  fixtureProbs: PlannerFixtureProb[];
+  teams: PlannerTeam[];
+  eliteSet: number[];
+  competitionId: number;
+  spreadMode: LmsSpreadMode;
+  spreadFloorSoft: number;
+  spreadOverrides: SpreadOverride[];
+  aliveEntries: AliveEntryInput[];
+}
+
+export async function getForwardPlanInputs(
+  entryId: number,
+  userId: number,
+): Promise<ForwardPlanInputs | null> {
+  const entryRows = await q<{
+    id: number;
+    competition_id: number;
+    start_gw: number;
+    reserve_strategy: LmsReserveStrategy;
+    confidence_floor: string;
+    spread_mode: LmsSpreadMode;
+    spread_floor_soft: string;
+  }>(
+    `select e.id, e.competition_id, c.start_gw, e.reserve_strategy, e.confidence_floor,
+            c.spread_mode, c.spread_floor_soft
+       from lms_entries e
+       join lms_competitions c on c.id = e.competition_id
+      where e.id = $1 and c.user_id = $2`,
+    [entryId, userId],
+  );
+  const e = entryRows[0];
+  if (!e) return null;
+
+  const [usedRows, reserveRows, globals, aliveEntries, spreadOverrides] =
+    await Promise.all([
+      q<{ team_id: number }>(
+        `select team_id from lms_entry_picks where entry_id = $1`,
+        [entryId],
+      ),
+      q<{ team_id: number }>(
+        `select team_id from lms_entry_reserves where entry_id = $1`,
+        [entryId],
+      ),
+      getCompetitionGlobals(e.start_gw),
+      getAliveEntryInputs(e.competition_id),
+      getSpreadOverrides(e.competition_id),
+    ]);
+
+  return {
+    entryState: {
+      usedTeamIds: usedRows.map((u) => u.team_id),
+      reservedTeamIds: reserveRows.map((r) => r.team_id),
+      strategy: e.reserve_strategy,
+      confidenceFloor: Number(e.confidence_floor),
+    },
+    upcomingRounds: globals.upcomingRounds,
+    fixtureProbs: globals.fixtureProbs,
+    teams: globals.teams,
+    eliteSet: globals.eliteSet,
+    competitionId: e.competition_id,
+    spreadMode: e.spread_mode,
+    spreadFloorSoft: Number(e.spread_floor_soft),
+    spreadOverrides,
+    aliveEntries,
+  };
+}
+
+// The cross-entry picture for ONE round of a competition: each alive entry's
+// locked (chosen) team and the spread engine's planned team for that round, plus
+// the teams backed by more than one alive entry (the duplicates PR D's awareness
+// row flags). Scoped by userId (ownership), matching getCompetition/getEntry.
+export async function getCompetitionSpreadView(
+  competitionId: number,
+  userId: number,
+  gw: number,
+): Promise<LmsCompetitionSpreadView | null> {
+  const compRows = await q<{
+    id: number;
+    start_gw: number;
+    spread_mode: LmsSpreadMode;
+    spread_floor_soft: string;
+  }>(
+    `select id, start_gw, spread_mode, spread_floor_soft
+       from lms_competitions where id = $1 and user_id = $2`,
+    [competitionId, userId],
+  );
+  const c = compRows[0];
+  if (!c) return null;
+
+  const [globals, aliveEntries, spreadOverrides] = await Promise.all([
+    getCompetitionGlobals(c.start_gw),
+    getAliveEntryInputs(competitionId),
+    getSpreadOverrides(competitionId),
+  ]);
+
+  const teamByFplId = new Map<number, Team>();
+  for (const t of await getAllTeams()) teamByFplId.set(t.fpl_id, t);
+
+  // Locked (chosen) picks for this round, per entry.
+  const aliveIds = aliveEntries.map((e) => e.entryId);
+  const chosenRows =
+    aliveIds.length > 0
+      ? await q<{ entry_id: number; team_id: number }>(
+          `select entry_id, team_id from lms_entry_picks
+            where entry_id = any($1::int[]) and gw = $2`,
+          [aliveIds, gw],
+        )
+      : [];
+  const chosenByEntry = new Map<number, number>();
+  for (const r of chosenRows) chosenByEntry.set(r.entry_id, r.team_id);
+
+  // Planned team per entry for this round, from the pure joint engine.
+  const plan = computeCompetitionPlan({
+    entries: aliveEntries.map((e) => ({
+      entryId: e.entryId,
+      entryState: e.entryState,
+    })),
+    upcomingRounds: globals.upcomingRounds,
+    fixtureProbs: globals.fixtureProbs,
+    teams: globals.teams,
+    eliteSet: globals.eliteSet,
+    spreadMode: c.spread_mode,
+    spreadFloorSoft: Number(c.spread_floor_soft),
+    overrides: spreadOverrides,
+  });
+  const plannedByEntry = new Map<
+    number,
+    { teamId: number | null; spreadSource: LmsSpreadSource }
+  >();
+  for (const ep of plan.entries) {
+    const pick = ep.picks.find((p) => p.gw === gw);
+    plannedByEntry.set(ep.entryId, {
+      teamId: pick?.teamId ?? null,
+      spreadSource: pick?.spreadSource ?? null,
+    });
+  }
+
+  const entries = aliveEntries.map((e) => {
+    const chosenId = chosenByEntry.get(e.entryId) ?? null;
+    const planned = plannedByEntry.get(e.entryId);
+    return {
+      entryId: e.entryId,
+      label: e.label,
+      status: e.status,
+      chosenTeam: chosenId != null ? (teamByFplId.get(chosenId) ?? null) : null,
+      plannedTeam:
+        planned?.teamId != null ? (teamByFplId.get(planned.teamId) ?? null) : null,
+      plannedSpreadSource: planned?.spreadSource ?? null,
+    };
+  });
+
+  // Duplicates: a team backed (chosen if locked, else planned) by >1 alive entry.
+  const counts = new Map<number, number>();
+  for (const e of entries) {
+    const id = e.chosenTeam?.fpl_id ?? e.plannedTeam?.fpl_id ?? null;
+    if (id != null) counts.set(id, (counts.get(id) ?? 0) + 1);
+  }
+  const duplicateTeamIds = [...counts.entries()]
+    .filter(([, n]) => n > 1)
+    .map(([id]) => id);
+
+  return {
+    competitionId,
+    gw,
+    spreadMode: c.spread_mode,
+    forceSame: spreadOverrides.some((o) => o.gw === gw && o.forceSame),
+    entries,
+    duplicateTeamIds,
   };
 }
 

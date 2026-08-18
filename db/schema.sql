@@ -202,18 +202,31 @@ create table if not exists lms_picks (
 -- to teams(fpl_id). Backfill of legacy lms_picks lives ONLY in the migration.
 
 create table if not exists lms_competitions (
-  id         serial primary key,
-  user_id    integer not null references users(id) on delete cascade,
-  name       text not null,
-  start_gw   int not null default 1,
-  notes      text,
-  created_at timestamptz default now()
+  id                serial primary key,
+  user_id           integer not null references users(id) on delete cascade,
+  name              text not null,
+  start_gw          int not null default 1,
+  notes             text,
+  created_at        timestamptz default now(),
+  -- Cross-entry variance ("Spread picks across entries"). See db/migrations/005.
+  spread_mode       text not null default 'off',      -- 'off' | 'soft' | 'strong'
+  spread_floor_soft numeric not null default 0.65      -- Soft floor (Strong ignores it)
 );
 
 create table if not exists lms_competition_deadlines (
   competition_id int not null references lms_competitions(id) on delete cascade,
   gw             int not null,
   deadline       timestamptz,               -- NULL = use computed default (day before first fixture)
+  primary key (competition_id, gw)
+);
+
+-- Per-round "use the same team across entries" override. force_same=true collapses
+-- the round to one safest team for all alive entries (any mode); also the row the
+-- engine records when a Soft round auto-collapses. See db/migrations/005.
+create table if not exists lms_competition_spread_overrides (
+  competition_id int not null references lms_competitions(id) on delete cascade,
+  gw             int not null,
+  force_same     boolean not null default true,
   primary key (competition_id, gw)
 );
 
@@ -234,6 +247,7 @@ create table if not exists lms_entry_picks (
   team_id     int not null references teams(fpl_id),
   result      text not null default 'pending',        -- 'pending' | 'survived' | 'eliminated'
   is_backfill boolean not null default false,
+  spread_source text,                                 -- 'spread' | 'matched' | null (see migration 005)
   unique (entry_id, gw),
   unique (entry_id, team_id)                          -- single-use team per entry per season
 );
