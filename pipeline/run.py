@@ -15,6 +15,7 @@ Requires env: DATABASE_URL (Railway Postgres connection string)
 """
 from __future__ import annotations
 
+import os
 import sys
 import traceback
 from collections import defaultdict
@@ -23,6 +24,7 @@ from typing import Optional
 
 import fpl_api
 import models
+import odds_api
 from db import connect, query, replace_recommendation, upsert
 
 
@@ -165,16 +167,63 @@ def step1_reference_data(conn, bootstrap, fixtures):
     return fixture_rows
 
 
-def step2_elo_and_fixture_probs(conn, bootstrap, fixture_rows):
-    """Return (strengths, exp_goals_by_fixture) for reuse in step 3."""
-    elo = models.seed_elo(bootstrap["teams"])
+def step2_elo_and_fixture_probs(conn, bootstrap, fixture_rows, svi_gw):
+    """Return (strengths, exp_goals_by_fixture) for reuse in step 3.
+
+    `svi_gw` is the gameweek the transfer-modifier snapshot is stored against
+    (the upcoming round the adjusted rating feeds); persisted per (team, gw) so
+    a re-run overwrites it idempotently.
+    """
+    seed = models.seed_elo(bootstrap["teams"])
 
     finished = [
         fx
         for fx in fixture_rows
         if fx["finished"] and fx["home_score"] is not None and fx["away_score"] is not None
     ]
-    elo = models.update_elo(elo, finished)
+
+    # --- squad-value transfer modifier -------------------------------------
+    # Nudge each team's SEED Elo by how its current squad value compares to what
+    # last season's seed implies, before running match updates. The shock decays
+    # out over DECAY_HORIZON *cumulative* completed matches this season, so it
+    # fades to zero by ~GW6 and the model reverts to pure form.
+    now = datetime.now(timezone.utc)
+    svi = models.squad_value_index(bootstrap["elements"])
+    svi_z = models._zscore(svi)
+    elo_z = models._zscore(seed)  # z of the PRE-modifier seed, per spec
+    shock = models.transfer_elo_shock(svi_z, elo_z)
+
+    # completed matches per team = CUMULATIVE season-to-date. `finished` is
+    # filtered from the full-season fixtures list (fpl_api.get_fixtures), NOT a
+    # per-run delta, so counting each team's appearances gives its running total.
+    completed: dict[int, int] = defaultdict(int)
+    for fx in finished:
+        for tid in (fx["home_team"], fx["away_team"]):
+            if tid is not None:
+                completed[tid] += 1
+
+    effective_seed: dict[int, float] = {}
+    svi_rows = []
+    for tid, base in seed.items():
+        weight = models.transfer_decay_weight(completed.get(tid, 0))
+        sh = shock.get(tid, 0.0)
+        effective_seed[tid] = base + sh * weight
+        if tid in svi:  # only teams with a computed SVI get a persisted row
+            svi_rows.append(
+                {
+                    "team_id": tid,
+                    "gw": svi_gw,
+                    "svi": round(svi[tid], 1),
+                    "svi_z": round(svi_z.get(tid, 0.0), 4),
+                    "transfer_elo_shock": round(sh, 3),
+                    "decay_weight": round(weight, 4),
+                    "computed_at": now,
+                }
+            )
+    if svi_gw is not None and svi_rows:
+        upsert(conn, "team_squad_value_index", svi_rows, "team_id,gw")
+
+    elo = models.update_elo(effective_seed, finished)
     strengths = models.team_strengths_from_elo(elo)
 
     # persist Elo + derived attack/defence ratings back onto teams.
@@ -200,7 +249,7 @@ def step2_elo_and_fixture_probs(conn, bootstrap, fixture_rows):
     # computed_at is set explicitly so it refreshes on every run: the column
     # default only fires on INSERT, so an ON CONFLICT UPDATE that omits it would
     # leave "last computed" stale even though the p_* values did update.
-    now = datetime.now(timezone.utc)
+    # (reuse `now` stamped above so the SVI + prob rows share one run timestamp)
     prob_rows = []
     exp_goals_by_fixture: dict[int, tuple[float, float]] = {}
     for fx in fixture_rows:
@@ -224,10 +273,106 @@ def step2_elo_and_fixture_probs(conn, bootstrap, fixture_rows):
 
     upsert(conn, "model_fixture_probs", prob_rows, "fixture_id")
     print(
-        f"[step 2] elo updated from {len(finished)} finished fixtures; "
+        f"[step 2] elo updated from {len(finished)} finished fixtures "
+        f"(transfer modifier applied to {len(svi_rows)} teams, gw {svi_gw}); "
         f"wrote {len(prob_rows)} fixture probabilities"
     )
     return strengths, exp_goals_by_fixture
+
+
+def step_odds_calibration(conn) -> None:
+    """QA-only: compare our model fixture probs against de-vigged bookmaker odds.
+
+    Independent sanity signal, NOT an input to the probability model (which stays
+    self-contained by design). Fetches h2h odds once from The Odds API, matches
+    each event to our upcoming fixtures, takes the MEDIAN odds across bookmakers,
+    de-vigs to implied probabilities, and stores them plus `market_divergence` on
+    model_fixture_probs so the web layer can flag big gaps.
+
+    Divergence is measured on the model's FAVOURED WIN SIDE — max(p_home, p_away),
+    the team we most back to win — vs the market's probability for that same side
+    (draw excluded), matching the LMS "back a team to win" framing.
+
+    Fails SOFT: a missing ODDS_API_KEY or any fetch error logs a warning and
+    returns without touching the run — this is an add-on, never a blocker.
+    """
+    api_key = os.environ.get("ODDS_API_KEY")
+    if not api_key:
+        print("[odds] ODDS_API_KEY not set; skipping market calibration (QA add-on)")
+        return
+
+    try:
+        events = odds_api.get_h2h_odds(api_key)
+    except Exception as exc:  # noqa: BLE001 — never let a QA add-on fail the run
+        print(f"[odds] fetch failed ({exc}); skipping market calibration")
+        return
+
+    # our upcoming fixtures with model probs, keyed by (home_id, away_id)
+    fx_rows = query(
+        conn,
+        "SELECT f.fpl_id, f.home_team, f.away_team, f.kickoff, "
+        "       mp.p_home, mp.p_away "
+        "  FROM fixtures f "
+        "  JOIN model_fixture_probs mp ON mp.fixture_id = f.fpl_id "
+        " WHERE f.finished = false AND f.gw IS NOT NULL",
+    )
+    fx_by_teams = {(r["home_team"], r["away_team"]): r for r in fx_rows}
+
+    teams = query(conn, "SELECT fpl_id, name, short_name FROM teams")
+    lookup = odds_api.build_team_lookup(teams)
+
+    now = datetime.now(timezone.utc)
+    rows = []
+    matched = unmatched = flagged = 0
+    for ev in events or []:
+        home_id = odds_api.match_team_id(ev.get("home_team"), lookup)
+        away_id = odds_api.match_team_id(ev.get("away_team"), lookup)
+        fx = fx_by_teams.get((home_id, away_id))
+        if fx is None or home_id is None or away_id is None:
+            unmatched += 1
+            continue
+
+        mo = odds_api.median_odds(ev)
+        if mo is None:
+            unmatched += 1
+            continue
+        devig = odds_api.implied_devig(mo["home"], mo["draw"], mo["away"])
+        if devig is None:
+            unmatched += 1
+            continue
+        mkt_home, mkt_draw, mkt_away = devig
+
+        p_home, p_away = fx["p_home"], fx["p_away"]
+        divergence = None
+        if p_home is not None and p_away is not None:
+            # favoured win side: whichever of home/away our model rates higher
+            if p_home >= p_away:
+                divergence = abs(p_home - mkt_home)
+            else:
+                divergence = abs(p_away - mkt_away)
+            if divergence > 0.15:
+                flagged += 1
+
+        rows.append(
+            {
+                "fixture_id": fx["fpl_id"],
+                "market_p_home": round(mkt_home, 4),
+                "market_p_draw": round(mkt_draw, 4),
+                "market_p_away": round(mkt_away, 4),
+                "market_divergence": round(divergence, 4) if divergence is not None else None,
+                "market_odds_source": "the-odds-api/median-uk",
+                "market_fetched_at": now,
+            }
+        )
+        matched += 1
+
+    # partial-column upsert: only the market_* columns are in each row, so ON
+    # CONFLICT (fixture_id) DO UPDATE leaves p_home/exp_goals_*/computed_at intact.
+    upsert(conn, "model_fixture_probs", rows, "fixture_id")
+    print(
+        f"[odds] market calibration: {matched} fixtures matched, "
+        f"{unmatched} unmatched, {flagged} flagged (divergence > 0.15)"
+    )
 
 
 def step3_player_ep(conn, bootstrap, fixture_rows, exp_goals_by_fixture, next_gw):
@@ -601,7 +746,12 @@ def main() -> int:
 
     with connect() as conn:
         fixture_rows = step1_reference_data(conn, bootstrap, fixtures)
-        _, exp_goals_by_fixture = step2_elo_and_fixture_probs(conn, bootstrap, fixture_rows)
+        # store the transfer-modifier snapshot against the upcoming round it feeds
+        svi_gw = next_gw if next_gw is not None else current_gw
+        _, exp_goals_by_fixture = step2_elo_and_fixture_probs(
+            conn, bootstrap, fixture_rows, svi_gw
+        )
+        step_odds_calibration(conn)  # QA add-on; fails soft, must run after step 2
         step3_player_ep(conn, bootstrap, fixture_rows, exp_goals_by_fixture, next_gw)
         step_player_season_stats(conn, bootstrap, current_season)
         step4_users(conn, current_gw, next_gw)

@@ -134,8 +134,33 @@ create table if not exists model_fixture_probs (
   fixture_id  int references fixtures(fpl_id) primary key,
   p_home real, p_draw real, p_away real,
   exp_goals_h real, exp_goals_a real,
-  computed_at timestamptz default now()
+  computed_at timestamptz default now(),
+  -- bookmaker odds calibration (QA only, NOT a model input) — see 004 migration.
+  -- Median across UK books, de-vigged; divergence on the model's favoured win side.
+  market_p_home      real,
+  market_p_draw      real,
+  market_p_away      real,
+  market_divergence  real,
+  market_odds_source text,
+  market_fetched_at  timestamptz
 );
+
+-- Per-team Squad Value Index + transfer-modifier components — see 003 migration.
+-- Persists WHY a seed Elo moved (squad value vs seed) so it's explainable and can
+-- feed the workstream-5 backtest. team_id -> teams(fpl_id); gw is a plain int.
+create table if not exists team_squad_value_index (
+  team_id             int not null references teams(fpl_id),
+  gw                  int not null,
+  svi                 numeric not null,
+  svi_z               numeric not null,
+  transfer_elo_shock  numeric not null,
+  decay_weight        numeric not null,
+  computed_at         timestamptz not null default now(),
+  primary key (team_id, gw)
+);
+
+create index if not exists team_squad_value_index_gw_idx
+  on team_squad_value_index (gw);
 
 create table if not exists gameweeks (
   gw           int primary key,

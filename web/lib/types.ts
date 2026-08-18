@@ -57,6 +57,14 @@ export interface ModelFixtureProbs {
   exp_goals_h: number | null;
   exp_goals_a: number | null;
   computed_at: string;
+  // Bookmaker market probabilities (QA calibration only — not a model input).
+  // Populated by the pipeline's odds step; null when unavailable. See 004 migration.
+  market_p_home: number | null;
+  market_p_draw: number | null;
+  market_p_away: number | null;
+  market_divergence: number | null;
+  market_odds_source: string | null;
+  market_fetched_at: string | null;
 }
 
 export interface Gameweek {
@@ -367,6 +375,11 @@ export interface LmsGameweekFixture {
   pHome: number | null;
   pDraw: number | null;
   pAway: number | null;
+  // Bookmaker market probabilities + divergence (QA calibration; null when
+  // unavailable). Surfaced as a "worth a look" badge when divergence is large.
+  marketPHome: number | null;
+  marketPAway: number | null;
+  marketDivergence: number | null;
 }
 
 // Round status derived from the deadline + fixtures' kickoffs/results.
