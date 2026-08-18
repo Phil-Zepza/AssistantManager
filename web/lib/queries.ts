@@ -17,10 +17,13 @@ import type {
   ModelFixtureProbs,
   PickPoolEntry,
   Player,
+  PlayerStatLine,
   Position,
   RecommendationLog,
+  ScoutingSeason,
   SquadEntry,
   Team,
+  TeamScouting,
   TransferSuggestion,
   User,
 } from "./types";
@@ -768,6 +771,149 @@ export async function getForwardPlanInputs(
     teams,
     eliteSet: computeEliteSet(teams),
   };
+}
+
+// Per-team scouting glance (recent form + top scorers + team xG) for the LMS
+// detail block. Prefers current-season stats, falling back to the most recent
+// past season (season === "last") until games are played. Reference/model data
+// — open to any signed-in user (no per-user rows). Empty input -> empty result.
+export async function getTeamScouting(
+  teamIds: number[],
+): Promise<TeamScouting[]> {
+  const ids = [...new Set(teamIds.filter((id) => Number.isInteger(id)))];
+  if (ids.length === 0) return [];
+
+  const [statRows, resultRows] = await Promise.all([
+    q<{
+      team_id: number;
+      web_name: string;
+      season: string;
+      is_current: boolean;
+      minutes: number | null;
+      goals: number | null;
+      xg: number | null;
+    }>(
+      `select p.team_id, p.web_name, s.season, s.is_current,
+              s.minutes, s.goals, s.xg
+         from players p
+         join player_season_stats s on s.player_id = p.fpl_id
+        where p.team_id = any($1::int[])`,
+      [ids],
+    ),
+    q<{
+      home_team: number | null;
+      away_team: number | null;
+      home_score: number | null;
+      away_score: number | null;
+    }>(
+      `select home_team, away_team, home_score, away_score
+         from fixtures
+        where finished = true
+          and home_score is not null and away_score is not null
+          and (home_team = any($1::int[]) or away_team = any($1::int[]))
+        order by kickoff asc nulls last, fpl_id asc`,
+      [ids],
+    ),
+  ]);
+
+  // Recent form: last ≤5 finished results per team, oldest → newest.
+  const formByTeam = new Map<number, ("W" | "D" | "L")[]>();
+  for (const id of ids) formByTeam.set(id, []);
+  for (const r of resultRows) {
+    if (r.home_score == null || r.away_score == null) continue;
+    const push = (id: number, res: "W" | "D" | "L") => {
+      const arr = formByTeam.get(id);
+      if (arr) arr.push(res);
+    };
+    const homeRes: "W" | "D" | "L" =
+      r.home_score > r.away_score ? "W" : r.home_score < r.away_score ? "L" : "D";
+    const awayRes: "W" | "D" | "L" =
+      homeRes === "W" ? "L" : homeRes === "L" ? "W" : "D";
+    if (r.home_team != null && formByTeam.has(r.home_team)) push(r.home_team, homeRes);
+    if (r.away_team != null && formByTeam.has(r.away_team)) push(r.away_team, awayRes);
+  }
+
+  // Group season stat rows by team, split current vs. most-recent past season.
+  interface TeamRows {
+    current: typeof statRows;
+    pastBySeason: Map<string, typeof statRows>;
+  }
+  const byTeam = new Map<number, TeamRows>();
+  for (const r of statRows) {
+    let t = byTeam.get(r.team_id);
+    if (!t) {
+      t = { current: [], pastBySeason: new Map() };
+      byTeam.set(r.team_id, t);
+    }
+    if (r.is_current) {
+      t.current.push(r);
+    } else {
+      const list = t.pastBySeason.get(r.season) ?? [];
+      list.push(r);
+      t.pastBySeason.set(r.season, list);
+    }
+  }
+
+  const sum = (rows: typeof statRows, key: "goals" | "xg"): number =>
+    rows.reduce((acc, r) => acc + (r[key] ?? 0), 0);
+
+  const topScorers = (rows: typeof statRows): PlayerStatLine[] =>
+    [...rows]
+      .filter((r) => (r.goals ?? 0) > 0)
+      .sort((a, b) => (b.goals ?? 0) - (a.goals ?? 0) || (b.xg ?? 0) - (a.xg ?? 0))
+      .slice(0, 3)
+      .map((r) => ({ name: r.web_name, goals: r.goals ?? 0, xg: r.xg }));
+
+  return ids.map((teamId): TeamScouting => {
+    const t = byTeam.get(teamId);
+    const form = formByTeam.get(teamId) ?? [];
+    const form5 = form.slice(-5);
+
+    if (!t) {
+      return {
+        teamId,
+        season: "none",
+        seasonLabel: null,
+        form: form5,
+        topScorers: [],
+        goalsFor: null,
+        xgFor: null,
+      };
+    }
+
+    // Prefer current-season data once any minutes have been played this season.
+    const currentMinutes = t.current.reduce((a, r) => a + (r.minutes ?? 0), 0);
+
+    let season: ScoutingSeason;
+    let seasonLabel: string | null;
+    let rows: typeof statRows;
+
+    if (currentMinutes > 0) {
+      season = "current";
+      seasonLabel = t.current[0]?.season ?? null;
+      rows = t.current;
+    } else if (t.pastBySeason.size > 0) {
+      // most recent past season by label (season strings sort chronologically)
+      const latest = [...t.pastBySeason.keys()].sort().at(-1)!;
+      season = "last";
+      seasonLabel = latest;
+      rows = t.pastBySeason.get(latest)!;
+    } else {
+      season = "none";
+      seasonLabel = null;
+      rows = [];
+    }
+
+    return {
+      teamId,
+      season,
+      seasonLabel,
+      form: form5,
+      topScorers: topScorers(rows),
+      goalsFor: rows.length > 0 ? sum(rows, "goals") : null,
+      xgFor: rows.length > 0 ? Math.round(sum(rows, "xg") * 10) / 10 : null,
+    };
+  });
 }
 
 // ---------- history ----------

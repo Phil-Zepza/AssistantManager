@@ -94,6 +94,22 @@ create table if not exists player_gw_stats (
   primary key (player_id, gw)
 );
 
+-- Season-aggregate player stats for the /lms scouting detail block. See
+-- db/migrations/002_player_season_stats.sql for the full rationale. is_current
+-- rows come from the bootstrap; past-season rows from element-summary
+-- history_past. The block prefers current-season totals, falling back to the
+-- most recent past season (labelled "last season") until games are played.
+create table if not exists player_season_stats (
+  player_id  int not null references players(fpl_id) on delete cascade,
+  season     text not null,
+  is_current boolean not null default false,
+  minutes    int, goals int, assists int,
+  xg real, xa real, xgi real, xgc real,
+  points     int,
+  updated_at timestamptz default now(),
+  primary key (player_id, season)
+);
+
 create table if not exists fixtures (
   fpl_id      int primary key,
   gw          int,

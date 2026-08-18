@@ -369,6 +369,43 @@ export interface LmsGameweekFixture {
   pAway: number | null;
 }
 
+// Round status derived from the deadline + fixtures' kickoffs/results.
+//   open          — before the round deadline (picks allowed).
+//   starting_soon — deadline passed, before the first kickoff.
+//   in_progress   — first kickoff reached, results still pending.
+//   complete      — all of the round's results are in.
+//   unknown       — no fixtures/data to derive from.
+export type LmsGwStatus =
+  | "open"
+  | "starting_soon"
+  | "in_progress"
+  | "complete"
+  | "unknown";
+
+// One standout player for the scouting detail block.
+export interface PlayerStatLine {
+  name: string; // players.web_name
+  goals: number;
+  xg: number | null; // expected goals for the season shown
+}
+
+// Which season the scouting numbers reflect (drives the "last season" label).
+export type ScoutingSeason = "current" | "last" | "none";
+
+// Per-team scouting glance shown on pick cards and expanded fixture rows:
+// recent form (W/D/L), top scorers and team xG. Current-season data is
+// preferred, falling back to the most recent past season until games are
+// played (see player_season_stats / db/migrations/002_player_season_stats.sql).
+export interface TeamScouting {
+  teamId: number;
+  season: ScoutingSeason;
+  seasonLabel: string | null; // e.g. "2025/26" when season === "last"
+  form: ("W" | "D" | "L")[]; // last ≤5 finished results, oldest → newest
+  topScorers: PlayerStatLine[]; // up to 3, by goals desc
+  goalsFor: number | null; // team goals in the season shown
+  xgFor: number | null; // team expected goals in the season shown
+}
+
 // ---- History ----
 
 // Canonical outcome shapes for recommendations_log.outcome jsonb.

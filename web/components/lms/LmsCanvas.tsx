@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
-  AlertTriangle,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
   Clock,
@@ -41,13 +41,16 @@ import {
   setRoundDeadline,
 } from "@/app/actions";
 import { formatPct } from "@/lib/format";
+import { deriveGwStatus, GW_STATUS_LABEL } from "@/lib/lmsStatus";
 import type {
   LmsCompetitionDetail,
   LmsCompetitionSummary,
   LmsEntryDetail,
   LmsGameweekFixture,
+  LmsGwStatus,
   LmsReserveStrategy,
   Team,
+  TeamScouting,
 } from "@/lib/types";
 import type { ForwardPlanInputs } from "@/lib/queries";
 
@@ -62,6 +65,7 @@ export type LmsCompDetail = {
   competition: LmsCompetitionDetail;
   fixtures: LmsGameweekFixture[];
   entries: LmsEntryData[];
+  teamStats: TeamScouting[];
   currentGw: number | null;
   firstEntryId: number;
 };
@@ -85,59 +89,56 @@ interface RankedPick {
   isHome: boolean;
 }
 
+// The single backable side of one fixture: the higher-win% team that has not
+// been used yet (falling back to the other side if the favourite is used).
+// Returns null when neither side is backable (both used, or no model probs).
+function pickFromFixture(
+  f: LmsGameweekFixture,
+  usedTeamIds: number[],
+): RankedPick | null {
+  const used = new Set(usedTeamIds);
+  const pH = f.pHome;
+  const pA = f.pAway;
+  const homeOk = f.homeTeam != null && !used.has(f.homeTeam.fpl_id) && pH != null;
+  const awayOk = f.awayTeam != null && !used.has(f.awayTeam.fpl_id) && pA != null;
+
+  const homePick = (): RankedPick => ({
+    fixtureId: f.fixtureId,
+    fixture: f,
+    team: f.homeTeam!,
+    opponent: f.awayTeam,
+    pWin: pH!,
+    pDraw: f.pDraw,
+    pLoss: pA ?? null,
+    isHome: true,
+  });
+  const awayPick = (): RankedPick => ({
+    fixtureId: f.fixtureId,
+    fixture: f,
+    team: f.awayTeam!,
+    opponent: f.homeTeam,
+    pWin: pA!,
+    pDraw: f.pDraw,
+    pLoss: pH ?? null,
+    isHome: false,
+  });
+
+  if (homeOk && awayOk) return (pA as number) > (pH as number) ? awayPick() : homePick();
+  if (homeOk) return homePick();
+  if (awayOk) return awayPick();
+  return null;
+}
+
 function getRankedPicks(
   fixtures: LmsGameweekFixture[],
   usedTeamIds: number[],
   n = 3,
 ): RankedPick[] {
-  const used = new Set(usedTeamIds);
-  const candidates: RankedPick[] = [];
-
-  for (const f of fixtures) {
-    const homeUsed = f.homeTeam != null && used.has(f.homeTeam.fpl_id);
-    const awayUsed = f.awayTeam != null && used.has(f.awayTeam.fpl_id);
-    const pH = f.pHome;
-    const pA = f.pAway;
-
-    if (!homeUsed && f.homeTeam && pH != null) {
-      if (!awayUsed && f.awayTeam && pA != null && pA > pH) {
-        candidates.push({
-          fixtureId: f.fixtureId,
-          fixture: f,
-          team: f.awayTeam,
-          opponent: f.homeTeam,
-          pWin: pA,
-          pDraw: f.pDraw,
-          pLoss: pH,
-          isHome: false,
-        });
-      } else {
-        candidates.push({
-          fixtureId: f.fixtureId,
-          fixture: f,
-          team: f.homeTeam,
-          opponent: f.awayTeam,
-          pWin: pH,
-          pDraw: f.pDraw,
-          pLoss: pA ?? null,
-          isHome: true,
-        });
-      }
-    } else if (!awayUsed && f.awayTeam && pA != null) {
-      candidates.push({
-        fixtureId: f.fixtureId,
-        fixture: f,
-        team: f.awayTeam,
-        opponent: f.homeTeam,
-        pWin: pA,
-        pDraw: f.pDraw,
-        pLoss: pH ?? null,
-        isHome: false,
-      });
-    }
-  }
-
-  return candidates.sort((a, b) => b.pWin - a.pWin).slice(0, n);
+  return fixtures
+    .map((f) => pickFromFixture(f, usedTeamIds))
+    .filter((p): p is RankedPick => p != null)
+    .sort((a, b) => b.pWin - a.pWin)
+    .slice(0, n);
 }
 
 function findCompetitionDeadline(
@@ -145,6 +146,159 @@ function findCompetitionDeadline(
   compId: number,
 ): { gw: number; deadline: string | null } | null {
   return competitions.find((c) => c.id === compId)?.nextDeadline ?? null;
+}
+
+// ─── Reserve-strategy copy (single source, reused across the add flows and the
+//     competition strategy selector) ─────────────────────────────────────────
+
+const RESERVE_STRATEGY_INFO: Record<
+  LmsReserveStrategy,
+  { label: string; blurb: string }
+> = {
+  safest: {
+    label: "Safest",
+    blurb:
+      "Always allocate the highest available win% each qualifying round; never hold back.",
+  },
+  manual: {
+    label: "Manual",
+    blurb:
+      "You nominate teams to reserve; the planner routes around them and prompts when a round has no safe non-reserved pick.",
+  },
+  smart: {
+    label: "Smart",
+    blurb:
+      "Auto-reserves the top-4 elite teams for their strongest weeks and deploys them when nothing else clears your confidence floor (default 65%).",
+  },
+};
+
+const STRATEGY_OPTIONS: { value: LmsReserveStrategy; label: string }[] = (
+  ["safest", "manual", "smart"] as LmsReserveStrategy[]
+).map((v) => ({ value: v, label: RESERVE_STRATEGY_INFO[v].label }));
+
+/** Concise inline explanation of the currently-selected reserve strategy. */
+function StrategyHelp({ mode }: { mode: LmsReserveStrategy }) {
+  return (
+    <p className="mt-1.5 text-xs leading-relaxed text-secondary">
+      {RESERVE_STRATEGY_INFO[mode].blurb}
+    </p>
+  );
+}
+
+// ─── Live client clock (null until mounted → no hydration drift) ─────────────
+
+function useNowMs(intervalMs = 30_000): number | null {
+  const [now, setNow] = useState<number | null>(null);
+  useEffect(() => {
+    setNow(Date.now());
+    const id = setInterval(() => setNow(Date.now()), intervalMs);
+    return () => clearInterval(id);
+  }, [intervalMs]);
+  return now;
+}
+
+// ─── Scouting detail block (recent form · top scorers · xG) ──────────────────
+
+const FORM_PIP: Record<"W" | "D" | "L", string> = {
+  W: "bg-[rgba(22,225,163,0.16)] text-success",
+  D: "bg-surface-2 text-muted",
+  L: "bg-[rgba(244,63,94,0.14)] text-danger",
+};
+
+function FormPips({ form }: { form: ("W" | "D" | "L")[] }) {
+  if (form.length === 0) {
+    return <span className="text-[11px] text-muted">No games yet</span>;
+  }
+  return (
+    <span className="flex items-center gap-1">
+      {form.map((r, i) => (
+        <span
+          key={i}
+          className={`grid h-4 w-4 place-items-center rounded text-[10px] font-bold ${FORM_PIP[r]}`}
+          aria-hidden
+        >
+          {r}
+        </span>
+      ))}
+      <span className="sr-only">Recent form: {form.join(", ")}</span>
+    </span>
+  );
+}
+
+/**
+ * Always-on scouting glance for one team: recent form, top scorers and team
+ * xG. Falls back to last-season numbers (clearly labelled) until current-season
+ * games have been played. Data comes from player_season_stats / fixtures.
+ */
+function ScoutingDetail({
+  scouting,
+}: {
+  scouting: TeamScouting | undefined;
+}) {
+  const hasStats = scouting != null && scouting.season !== "none";
+
+  if (!scouting || (!hasStats && scouting.form.length === 0)) {
+    return (
+      <p className="text-[11px] text-muted">
+        Detail appears after the next data run.
+      </p>
+    );
+  }
+
+  const isLast = scouting.season === "last";
+
+  return (
+    <div className="space-y-2.5">
+      {/* Recent form */}
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className="text-[10px] font-semibold uppercase tracking-wide text-muted">
+          Form
+        </span>
+        <FormPips form={scouting.form} />
+        {isLast && (
+          <Badge tone="gray">
+            last season{scouting.seasonLabel ? ` · ${scouting.seasonLabel}` : ""}
+          </Badge>
+        )}
+      </div>
+
+      <div className="flex items-start justify-between gap-4">
+        {/* Top scorers */}
+        <div className="min-w-0">
+          <span className="block text-[10px] font-semibold uppercase tracking-wide text-muted">
+            Top scorers
+          </span>
+          {scouting.topScorers.length === 0 ? (
+            <span className="text-xs text-muted">—</span>
+          ) : (
+            <ul className="mt-0.5 space-y-0.5">
+              {scouting.topScorers.map((s) => (
+                <li key={s.name} className="text-xs text-primary truncate">
+                  <span className="font-semibold">{s.name}</span>{" "}
+                  <span className="tnum text-secondary">{s.goals}⚽</span>
+                  {s.xg != null && (
+                    <span className="ml-1 tnum text-muted">
+                      {s.xg.toFixed(1)} xG
+                    </span>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+
+        {/* Team xG */}
+        <div className="shrink-0 text-right">
+          <span className="block text-[10px] font-semibold uppercase tracking-wide text-muted">
+            Team xG
+          </span>
+          <span className="tnum text-lg font-bold text-primary">
+            {scouting.xgFor != null ? scouting.xgFor.toFixed(1) : "—"}
+          </span>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 // ─── Main canvas ──────────────────────────────────────────────────────────────
@@ -225,7 +379,13 @@ export function LmsCanvas({
     [compDetail?.fixtures, usedTeamIds],
   );
 
+  const teamStatsById = useMemo(
+    () => new Map((compDetail?.teamStats ?? []).map((s) => [s.teamId, s])),
+    [compDetail?.teamStats],
+  );
+
   const currentGw = compDetail?.currentGw ?? null;
+  const nowMs = useNowMs();
 
   // ── Strategy handlers ──────────────────────────────────────────────────────
 
@@ -305,6 +465,23 @@ export function LmsCanvas({
     compDetail.competition.id,
   );
 
+  const gwStatus: LmsGwStatus =
+    nowMs == null
+      ? "unknown"
+      : deriveGwStatus({
+          deadline: nextDeadline?.deadline ?? null,
+          fixtures: compDetail.fixtures,
+          nowMs,
+        });
+
+  const alreadyLocked = !!selectedEntry?.detail.picks.some(
+    (p) => p.gw === currentGw,
+  );
+  // Picks are writable while the round is open (before the deadline). "unknown"
+  // (pre-mount / no fixture data) stays lenient so controls don't flash out.
+  const canPick =
+    !alreadyLocked && (gwStatus === "open" || gwStatus === "unknown");
+
   return (
     <div className="pb-24 md:pb-8">
       {/* Back + entry switcher */}
@@ -315,6 +492,7 @@ export function LmsCanvas({
         onSelectEntry={(id) => setSelectedEntryId(id)}
         onAddEntry={() => setAddEntryOpen(true)}
         currentGw={currentGw}
+        gwStatus={gwStatus}
         usedCount={usedTeamIds.length}
         remainingCount={
           (selectedEntry?.detail.teams.filter((t) => !t.used).length ?? 0)
@@ -337,14 +515,16 @@ export function LmsCanvas({
             fixtures={compDetail.fixtures}
             currentGw={currentGw}
             usedTeamIds={usedTeamIds}
+            teamStatsById={teamStatsById}
+            canPick={canPick}
+            onBackPick={(pick) => setConfirmPick(pick)}
           />
 
           <Top3Section
             currentGw={currentGw}
             rankedPicks={rankedPicks}
-            alreadyLocked={
-              !!selectedEntry?.detail.picks.some((p) => p.gw === currentGw)
-            }
+            teamStatsById={teamStatsById}
+            canPick={canPick}
             onBackPick={(pick) => setConfirmPick(pick)}
           />
 
@@ -542,6 +722,17 @@ function LobbyScreen({
 
 // ─── Competition: entry header ─────────────────────────────────────────────────
 
+const GW_STATUS_TONE: Record<
+  LmsGwStatus,
+  "success" | "accent" | "warning" | "gray"
+> = {
+  open: "success",
+  starting_soon: "warning",
+  in_progress: "accent",
+  complete: "gray",
+  unknown: "gray",
+};
+
 function EntryHeader({
   competition,
   entries,
@@ -549,6 +740,7 @@ function EntryHeader({
   onSelectEntry,
   onAddEntry,
   currentGw,
+  gwStatus,
   usedCount,
   remainingCount,
   nextDeadline,
@@ -561,6 +753,7 @@ function EntryHeader({
   onSelectEntry: (id: number) => void;
   onAddEntry: () => void;
   currentGw: number | null;
+  gwStatus: LmsGwStatus;
   usedCount: number;
   remainingCount: number;
   nextDeadline: { gw: number; deadline: string | null } | null;
@@ -638,7 +831,16 @@ function EntryHeader({
             {isAlive ? "Alive" : "Out"}
           </Badge>
 
-          {nextDeadline?.deadline && (
+          {/* Round lifecycle status */}
+          {gwStatus !== "unknown" && (
+            <Badge tone={GW_STATUS_TONE[gwStatus]} className="shrink-0">
+              {GW_STATUS_LABEL[gwStatus]}
+            </Badge>
+          )}
+
+          {/* Deadline: a live countdown while the round is still open, else a
+              short static note reflecting where the round is. */}
+          {nextDeadline?.deadline && gwStatus === "open" ? (
             <button
               type="button"
               onClick={onDeadlineClick}
@@ -652,6 +854,22 @@ function EntryHeader({
                 passedLabel="Deadline passed"
               />
             </button>
+          ) : (
+            gwStatus !== "unknown" && (
+              <button
+                type="button"
+                onClick={onDeadlineClick}
+                className="flex items-center gap-1 text-xs text-secondary hover:text-primary focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent rounded"
+                title="Edit deadline"
+              >
+                <Clock className="h-3.5 w-3.5" aria-hidden />
+                {gwStatus === "starting_soon"
+                  ? "Deadline passed · kicking off soon"
+                  : gwStatus === "in_progress"
+                    ? "Round in progress"
+                    : "Round complete"}
+              </button>
+            )
           )}
 
           <span className="ml-auto text-xs font-medium text-secondary shrink-0">
@@ -669,12 +887,18 @@ function FixturesSection({
   fixtures,
   currentGw,
   usedTeamIds,
+  teamStatsById,
+  canPick,
+  onBackPick,
 }: {
   fixtures: LmsGameweekFixture[];
   currentGw: number | null;
   usedTeamIds: number[];
+  teamStatsById: Map<number, TeamScouting>;
+  canPick: boolean;
+  onBackPick: (pick: RankedPick) => void;
 }) {
-  const used = new Set(usedTeamIds);
+  const [expandedId, setExpandedId] = useState<number | null>(null);
 
   return (
     <section className="mt-2 mb-5">
@@ -690,72 +914,175 @@ function FixturesSection({
         </Card>
       ) : (
         <div className="space-y-2">
-          {fixtures.map((f) => {
-            const homeUsed = f.homeTeam != null && used.has(f.homeTeam.fpl_id);
-            const awayUsed = f.awayTeam != null && used.has(f.awayTeam.fpl_id);
-            return (
-              <Card key={f.fixtureId} padding="sm">
-                <div className="flex items-center gap-3">
-                  {/* Home side */}
-                  <div
-                    className={`flex items-center gap-2 flex-1 min-w-0 ${homeUsed ? "opacity-40" : ""}`}
-                  >
-                    <ClubBadge
-                      code={f.homeTeam?.short_name}
-                      size={32}
-                      state={homeUsed ? "used" : "default"}
-                    />
-                    <div className="min-w-0">
-                      <p className="text-sm font-semibold text-primary truncate">
-                        {f.homeTeam?.short_name ?? "?"}
-                      </p>
-                      {f.pHome != null && (
-                        <p className="text-xs font-bold tnum text-accent">
-                          {formatPct(f.pHome)}
-                        </p>
-                      )}
-                    </div>
-                  </div>
-
-                  {/* Prob bar + vs */}
-                  <div className="w-24 shrink-0">
-                    <ProbBar
-                      home={f.pHome}
-                      draw={f.pDraw}
-                      away={f.pAway}
-                    />
-                    <p className="mt-0.5 text-center text-[11px] text-muted">
-                      {f.pDraw != null ? `D ${formatPct(f.pDraw)}` : "vs"}
-                    </p>
-                  </div>
-
-                  {/* Away side */}
-                  <div
-                    className={`flex items-center gap-2 flex-1 min-w-0 justify-end ${awayUsed ? "opacity-40" : ""}`}
-                  >
-                    <div className="min-w-0 text-right">
-                      <p className="text-sm font-semibold text-primary truncate">
-                        {f.awayTeam?.short_name ?? "?"}
-                      </p>
-                      {f.pAway != null && (
-                        <p className="text-xs font-bold tnum text-accent">
-                          {formatPct(f.pAway)}
-                        </p>
-                      )}
-                    </div>
-                    <ClubBadge
-                      code={f.awayTeam?.short_name}
-                      size={32}
-                      state={awayUsed ? "used" : "default"}
-                    />
-                  </div>
-                </div>
-              </Card>
-            );
-          })}
+          {fixtures.map((f) => (
+            <FixtureRow
+              key={f.fixtureId}
+              fixture={f}
+              usedTeamIds={usedTeamIds}
+              teamStatsById={teamStatsById}
+              canPick={canPick}
+              expanded={expandedId === f.fixtureId}
+              onToggle={() =>
+                setExpandedId((prev) =>
+                  prev === f.fixtureId ? null : f.fixtureId,
+                )
+              }
+              onBackPick={onBackPick}
+            />
+          ))}
         </div>
       )}
     </section>
+  );
+}
+
+function FixtureRow({
+  fixture: f,
+  usedTeamIds,
+  teamStatsById,
+  canPick,
+  expanded,
+  onToggle,
+  onBackPick,
+}: {
+  fixture: LmsGameweekFixture;
+  usedTeamIds: number[];
+  teamStatsById: Map<number, TeamScouting>;
+  canPick: boolean;
+  expanded: boolean;
+  onToggle: () => void;
+  onBackPick: (pick: RankedPick) => void;
+}) {
+  const used = new Set(usedTeamIds);
+  const homeUsed = f.homeTeam != null && used.has(f.homeTeam.fpl_id);
+  const awayUsed = f.awayTeam != null && used.has(f.awayTeam.fpl_id);
+
+  // Backable side of this fixture (favoured available team; null if none).
+  const pick = pickFromFixture(f, usedTeamIds);
+
+  return (
+    <Card padding="sm">
+      <div className="flex items-center gap-2">
+        {/* Expand toggle wraps the fixture summary */}
+        <button
+          type="button"
+          onClick={onToggle}
+          aria-expanded={expanded}
+          className="flex flex-1 items-center gap-3 min-w-0 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent rounded"
+        >
+          {/* Home side */}
+          <div
+            className={`flex items-center gap-2 flex-1 min-w-0 ${homeUsed ? "opacity-40" : ""}`}
+          >
+            <ClubBadge
+              code={f.homeTeam?.short_name}
+              size={32}
+              state={homeUsed ? "used" : "default"}
+            />
+            <div className="min-w-0">
+              <p className="text-sm font-semibold text-primary truncate">
+                {f.homeTeam?.short_name ?? "?"}
+              </p>
+              {f.pHome != null && (
+                <p className="text-xs font-bold tnum text-accent">
+                  {formatPct(f.pHome)}
+                </p>
+              )}
+            </div>
+          </div>
+
+          {/* Prob bar + vs */}
+          <div className="w-24 shrink-0">
+            <ProbBar home={f.pHome} draw={f.pDraw} away={f.pAway} />
+            <p className="mt-0.5 text-center text-[11px] text-muted">
+              {f.pDraw != null ? `D ${formatPct(f.pDraw)}` : "vs"}
+            </p>
+          </div>
+
+          {/* Away side */}
+          <div
+            className={`flex items-center gap-2 flex-1 min-w-0 justify-end ${awayUsed ? "opacity-40" : ""}`}
+          >
+            <div className="min-w-0 text-right">
+              <p className="text-sm font-semibold text-primary truncate">
+                {f.awayTeam?.short_name ?? "?"}
+              </p>
+              {f.pAway != null && (
+                <p className="text-xs font-bold tnum text-accent">
+                  {formatPct(f.pAway)}
+                </p>
+              )}
+            </div>
+            <ClubBadge
+              code={f.awayTeam?.short_name}
+              size={32}
+              state={awayUsed ? "used" : "default"}
+            />
+          </div>
+
+          <ChevronDown
+            className={`h-4 w-4 shrink-0 text-muted transition-transform duration-micro ${expanded ? "rotate-180" : ""}`}
+            aria-hidden
+          />
+        </button>
+
+        {/* Back control — any fixture is backable (favoured available side) */}
+        {canPick && pick && (
+          <Button
+            size="sm"
+            variant="secondary"
+            className="shrink-0"
+            onClick={() => onBackPick(pick)}
+          >
+            Back {pick.team.short_name}
+          </Button>
+        )}
+      </div>
+
+      {expanded && (
+        <div className="mt-3 grid grid-cols-1 gap-3 border-t border-subtle pt-3 sm:grid-cols-2">
+          <FixtureTeamDetail
+            team={f.homeTeam}
+            venue="H"
+            scouting={
+              f.homeTeam ? teamStatsById.get(f.homeTeam.fpl_id) : undefined
+            }
+          />
+          <FixtureTeamDetail
+            team={f.awayTeam}
+            venue="A"
+            scouting={
+              f.awayTeam ? teamStatsById.get(f.awayTeam.fpl_id) : undefined
+            }
+          />
+        </div>
+      )}
+    </Card>
+  );
+}
+
+// One team's header (badge + name + venue) above its scouting detail. Used in
+// the expandable fixture rows so both sides are shown side by side.
+function FixtureTeamDetail({
+  team,
+  venue,
+  scouting,
+}: {
+  team: Team | null;
+  venue: "H" | "A";
+  scouting: TeamScouting | undefined;
+}) {
+  return (
+    <div className="rounded-lg bg-surface-2 p-2.5">
+      <div className="mb-2 flex items-center gap-2">
+        <ClubBadge code={team?.short_name} size={24} />
+        <span className="truncate text-xs font-semibold text-primary">
+          {team?.short_name ?? "?"}{" "}
+          <span className="font-normal text-muted">({venue})</span>
+        </span>
+      </div>
+      <ScoutingDetail scouting={scouting} />
+    </div>
   );
 }
 
@@ -764,12 +1091,14 @@ function FixturesSection({
 function Top3Section({
   currentGw,
   rankedPicks,
-  alreadyLocked,
+  teamStatsById,
+  canPick,
   onBackPick,
 }: {
   currentGw: number | null;
   rankedPicks: RankedPick[];
-  alreadyLocked: boolean;
+  teamStatsById: Map<number, TeamScouting>;
+  canPick: boolean;
   onBackPick: (pick: RankedPick) => void;
 }) {
   return (
@@ -781,9 +1110,8 @@ function Top3Section({
       {rankedPicks.length === 0 ? (
         <Card>
           <p className="text-sm text-secondary">
-            {alreadyLocked
-              ? "Pick already locked for this round."
-              : "No ranked options yet — win probabilities appear once the model has run."}
+            No ranked options yet — win probabilities appear once the model has
+            run.
           </p>
         </Card>
       ) : (
@@ -793,7 +1121,8 @@ function Top3Section({
               key={pick.fixtureId}
               pick={pick}
               rank={i + 1}
-              alreadyLocked={alreadyLocked}
+              canPick={canPick}
+              scouting={teamStatsById.get(pick.team.fpl_id)}
               onBackPick={onBackPick}
             />
           ))}
@@ -806,12 +1135,14 @@ function Top3Section({
 function PickCard({
   pick,
   rank,
-  alreadyLocked,
+  canPick,
+  scouting,
   onBackPick,
 }: {
   pick: RankedPick;
   rank: number;
-  alreadyLocked: boolean;
+  canPick: boolean;
+  scouting: TeamScouting | undefined;
   onBackPick: (pick: RankedPick) => void;
 }) {
   const venue = pick.isHome ? "H" : "A";
@@ -850,11 +1181,13 @@ function PickCard({
 
         <ProbBar home={pick.pWin} draw={pick.pDraw} away={pick.pLoss} showLabels />
 
-        {!alreadyLocked && (
-          <Button
-            className="mt-3 w-full"
-            onClick={() => onBackPick(pick)}
-          >
+        {/* Full detail always shown on pick cards */}
+        <div className="mt-3 border-t border-subtle pt-3">
+          <ScoutingDetail scouting={scouting} />
+        </div>
+
+        {canPick && (
+          <Button className="mt-3 w-full" onClick={() => onBackPick(pick)}>
             Back this pick
           </Button>
         )}
@@ -884,15 +1217,16 @@ function PickCard({
           </span>
           <span className="text-[11px] text-muted">win</span>
         </span>
-        {!alreadyLocked && (
-          <Button
-            size="sm"
-            variant="secondary"
-            onClick={() => onBackPick(pick)}
-          >
+        {canPick && (
+          <Button size="sm" variant="secondary" onClick={() => onBackPick(pick)}>
             Back
           </Button>
         )}
+      </div>
+
+      {/* Full detail always shown on pick cards */}
+      <div className="mt-2.5 border-t border-subtle pt-2.5">
+        <ScoutingDetail scouting={scouting} />
       </div>
     </Card>
   );
@@ -1098,12 +1432,6 @@ function StrategySection({
   onFloorCommit: (pct: number) => void;
   onReserveToggle: (teamId: number) => void;
 }) {
-  const strategyOptions: { value: LmsReserveStrategy; label: string }[] = [
-    { value: "safest", label: "Safest" },
-    { value: "manual", label: "Manual" },
-    { value: "smart", label: "Smart" },
-  ];
-
   // Available teams for the manual reserve tray
   const availableForReserve = entry.teams.filter((t) => !t.used);
 
@@ -1117,22 +1445,16 @@ function StrategySection({
           <div>
             <SegmentedControl
               aria-label="Reserve strategy"
-              options={strategyOptions}
+              options={STRATEGY_OPTIONS}
               value={strategyMode}
               onValueChange={(v) => onStrategyChange(v as LmsReserveStrategy)}
               fullWidth
             />
+            <StrategyHelp mode={strategyMode} />
             {saving && (
               <p className="mt-1.5 text-xs text-muted">Saving…</p>
             )}
           </div>
-
-          {strategyMode === "safest" && (
-            <p className="text-xs text-secondary">
-              Always picks the top outright-win side. No reserving — confidence
-              floor not used.
-            </p>
-          )}
 
           {strategyMode !== "safest" && (
             <div>
@@ -1487,12 +1809,6 @@ function AddCompSheet({
     { value: "inflight", label: "Joining in-flight" },
   ];
 
-  const strategyOptions: { value: LmsReserveStrategy; label: string }[] = [
-    { value: "safest", label: "Safest" },
-    { value: "manual", label: "Manual" },
-    { value: "smart", label: "Smart" },
-  ];
-
   return (
     <BottomSheet
       open={open}
@@ -1541,11 +1857,12 @@ function AddCompSheet({
           </label>
           <SegmentedControl
             aria-label="Reserve strategy"
-            options={strategyOptions}
+            options={STRATEGY_OPTIONS}
             value={strategy}
             onValueChange={(v) => setStrategyLocal(v as LmsReserveStrategy)}
             fullWidth
           />
+          <StrategyHelp mode={strategy} />
         </div>
 
         {variant === "inflight" && (
@@ -1679,12 +1996,6 @@ function AddEntrySheet({
     }
   }
 
-  const strategyOptions: { value: LmsReserveStrategy; label: string }[] = [
-    { value: "safest", label: "Safest" },
-    { value: "manual", label: "Manual" },
-    { value: "smart", label: "Smart" },
-  ];
-
   return (
     <BottomSheet
       open={open}
@@ -1705,11 +2016,12 @@ function AddEntrySheet({
           </label>
           <SegmentedControl
             aria-label="Reserve strategy"
-            options={strategyOptions}
+            options={STRATEGY_OPTIONS}
             value={strategy}
             onValueChange={(v) => setStrategyLocal(v as LmsReserveStrategy)}
             fullWidth
           />
+          <StrategyHelp mode={strategy} />
         </div>
 
         {error && <p className="text-sm text-danger">{error}</p>}

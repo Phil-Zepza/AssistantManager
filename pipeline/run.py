@@ -4,6 +4,8 @@ Runs these steps (see SPEC.md 'What the pipeline must do'):
   1. fetch bootstrap + fixtures -> upsert teams / players / fixtures / gameweeks
   2. update Elo from finished fixtures -> model_fixture_probs for upcoming GWs
   3. model_player_ep for the next GW
+  6. player_season_stats: current-season totals (bootstrap) + last-season
+     totals (element-summary history_past) for the /lms scouting block
   4. per-user squads + recommendations_log
   5. auto-resolve finished LMS rounds -> settle lms_entry_picks + entry status
 All upserts idempotent; one summary line per step.
@@ -16,6 +18,7 @@ from __future__ import annotations
 import sys
 import traceback
 from collections import defaultdict
+from datetime import datetime, timezone
 from typing import Optional
 
 import fpl_api
@@ -31,6 +34,30 @@ def _to_float(x) -> Optional[float]:
         return float(x)
     except (TypeError, ValueError):
         return None
+
+
+def _to_int(x) -> Optional[int]:
+    if x is None or x == "":
+        return None
+    try:
+        return int(float(x))
+    except (TypeError, ValueError):
+        return None
+
+
+def _season_label(events: list[dict]) -> Optional[str]:
+    """Derive the current season label (e.g. "2026/27") from the events'
+    earliest deadline year. The PL season starts in August, so the minimum
+    deadline year is the season's opening year."""
+    years = [
+        int(e["deadline_time"][:4])
+        for e in events
+        if e.get("deadline_time")
+    ]
+    if not years:
+        return None
+    start = min(years)
+    return f"{start}/{str(start + 1)[-2:]}"
 
 
 def _find_current_gw(events: list[dict]) -> Optional[int]:
@@ -169,7 +196,11 @@ def step2_elo_and_fixture_probs(conn, bootstrap, fixture_rows):
         )
     upsert(conn, "teams", team_updates, "fpl_id")
 
-    # fixture probs for every upcoming (not-finished) fixture with a GW assigned
+    # fixture probs for every upcoming (not-finished) fixture with a GW assigned.
+    # computed_at is set explicitly so it refreshes on every run: the column
+    # default only fires on INSERT, so an ON CONFLICT UPDATE that omits it would
+    # leave "last computed" stale even though the p_* values did update.
+    now = datetime.now(timezone.utc)
     prob_rows = []
     exp_goals_by_fixture: dict[int, tuple[float, float]] = {}
     for fx in fixture_rows:
@@ -186,6 +217,7 @@ def step2_elo_and_fixture_probs(conn, bootstrap, fixture_rows):
                 "p_away": round(row["p_away"], 4),
                 "exp_goals_h": round(row["exp_goals_h"], 3),
                 "exp_goals_a": round(row["exp_goals_a"], 3),
+                "computed_at": now,
             }
         )
         exp_goals_by_fixture[fx["fpl_id"]] = (row["exp_goals_h"], row["exp_goals_a"])
@@ -239,6 +271,102 @@ def step3_player_ep(conn, bootstrap, fixture_rows, exp_goals_by_fixture, next_gw
     upsert(conn, "model_player_ep", ep_rows, "player_id,gw,horizon")
     print(f"[step 3] wrote model_player_ep for GW{next_gw}: {len(ep_rows)} players")
     return next_gw
+
+
+def build_current_season_stat_rows(
+    elements: list[dict], season: str
+) -> list[dict]:
+    """Current-season per-player season totals, straight from the bootstrap
+    `elements` (already fetched — no extra API calls). These accumulate through
+    the season; the /lms scouting block prefers them over last-season stats as
+    soon as any minutes have been played."""
+    rows = []
+    for e in elements:
+        rows.append(
+            {
+                "player_id": e["id"],
+                "season": season,
+                "is_current": True,
+                "minutes": _to_int(e.get("minutes")),
+                "goals": _to_int(e.get("goals_scored")),
+                "assists": _to_int(e.get("assists")),
+                "xg": _to_float(e.get("expected_goals")),
+                "xa": _to_float(e.get("expected_assists")),
+                "xgi": _to_float(e.get("expected_goal_involvements")),
+                "xgc": _to_float(e.get("expected_goals_conceded")),
+                "points": _to_int(e.get("total_points")),
+            }
+        )
+    return rows
+
+
+def step_player_season_stats(conn, bootstrap, current_season):
+    """Populate player_season_stats: current-season totals from the bootstrap
+    (cheap) plus each player's most recent PAST season from element-summary
+    history_past. The scouting detail block on /lms falls back to the past
+    season (labelled "last season") until real games have been played.
+
+    The per-player element-summary fetch is bounded: players that already have
+    any past-season row are skipped, so the ~1-call-per-player cost is paid on
+    the first run and then only for newly-added players."""
+    if current_season is None:
+        print("[step 6] no season label derivable; skipped season stats")
+        return
+
+    elements = bootstrap["elements"]
+    cur_rows = build_current_season_stat_rows(elements, current_season)
+    upsert(conn, "player_season_stats", cur_rows, ["player_id", "season"])
+
+    existing = query(
+        conn,
+        "SELECT DISTINCT player_id FROM player_season_stats WHERE is_current = false",
+    )
+    have = {r["player_id"] for r in existing}
+
+    past_rows = []
+    fetched = 0
+    errors = 0
+    for e in elements:
+        pid = e["id"]
+        if pid in have:
+            continue
+        try:
+            summary = fpl_api.get_element_summary(pid)
+        except Exception:
+            errors += 1
+            continue
+        past = summary.get("history_past") or []
+        if not past:
+            continue
+        last = past[-1]  # most recent past season
+        season_name = last.get("season_name")
+        if not season_name:
+            continue
+        past_rows.append(
+            {
+                "player_id": pid,
+                "season": season_name,
+                "is_current": False,
+                "minutes": _to_int(last.get("minutes")),
+                "goals": _to_int(last.get("goals_scored")),
+                "assists": _to_int(last.get("assists")),
+                "xg": _to_float(last.get("expected_goals")),
+                "xa": _to_float(last.get("expected_assists")),
+                "xgi": _to_float(last.get("expected_goal_involvements")),
+                "xgc": _to_float(last.get("expected_goals_conceded")),
+                "points": _to_int(last.get("total_points")),
+            }
+        )
+        fetched += 1
+
+    if past_rows:
+        upsert(conn, "player_season_stats", past_rows, ["player_id", "season"])
+
+    print(
+        f"[step 6] season stats: {len(cur_rows)} current-season rows; "
+        f"fetched {fetched} players' last-season totals "
+        f"({len(have)} already had one, {errors} fetch errors)"
+    )
 
 
 def step4_users(conn, current_gw, next_gw):
@@ -468,12 +596,14 @@ def main() -> int:
     events = bootstrap["events"]
     current_gw = _find_current_gw(events)
     next_gw = _find_next_gw(events)
-    print(f"  current GW = {current_gw}, next GW = {next_gw}")
+    current_season = _season_label(events)
+    print(f"  current GW = {current_gw}, next GW = {next_gw}, season = {current_season}")
 
     with connect() as conn:
         fixture_rows = step1_reference_data(conn, bootstrap, fixtures)
         _, exp_goals_by_fixture = step2_elo_and_fixture_probs(conn, bootstrap, fixture_rows)
         step3_player_ep(conn, bootstrap, fixture_rows, exp_goals_by_fixture, next_gw)
+        step_player_season_stats(conn, bootstrap, current_season)
         step4_users(conn, current_gw, next_gw)
         step5_lms_resolve(conn)
 

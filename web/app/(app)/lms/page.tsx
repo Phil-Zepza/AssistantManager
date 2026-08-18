@@ -8,6 +8,7 @@ import {
   getEntry,
   getGameweekFixtures,
   getForwardPlanInputs,
+  getTeamScouting,
 } from "@/lib/queries";
 import { LmsCanvas } from "@/components/lms/LmsCanvas";
 
@@ -45,6 +46,17 @@ export default async function LmsPage({
       const fixtures =
         currentGw != null ? await getGameweekFixtures(currentGw) : [];
 
+      const teamIds = [
+        ...new Set(
+          fixtures.flatMap((f) =>
+            [f.homeTeam?.fpl_id, f.awayTeam?.fpl_id].filter(
+              (id): id is number => id != null,
+            ),
+          ),
+        ),
+      ];
+      const teamStats = await getTeamScouting(teamIds);
+
       const entriesData = await Promise.all(
         comp.entries.map(async (e) => {
           const [detail, planInputs] = await Promise.all([
@@ -64,6 +76,7 @@ export default async function LmsPage({
         competition: comp,
         fixtures,
         entries,
+        teamStats,
         currentGw,
         firstEntryId: comp.entries[0]?.id ?? 0,
       };
