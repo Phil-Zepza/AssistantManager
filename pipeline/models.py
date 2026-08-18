@@ -18,8 +18,18 @@ from typing import Optional
 # ============================ TUNABLE CONSTANTS ============================
 # --- Elo ---
 ELO_BASE = 1500.0            # league-average team rating
-ELO_PROMOTED = 1420.0        # rough floor for freshly-promoted / weakest sides
-ELO_SEED_SCALE = 0.5         # maps bootstrap strength deviation -> Elo points
+ELO_PROMOTED = 1420.0        # floor for freshly-promoted / weakest sides (base-80)
+ELO_STRONG = 1580.0          # ceiling for the strongest sides (base+80, symmetric)
+# Seeding is SCALE-INVARIANT: each team's strength proxy is z-scored across the
+# league and mapped to Elo at ELO_SEED_SPREAD points per standard deviation. This
+# works whether the FPL API exposes the coarse 2-5 strength tiers (preseason) or
+# the fine ~1000-1400 scale (mid-season) — the z-score normalises either. Tuned so
+# the widest realistic mismatch (top tier at home vs a promoted side) lands ~76%
+# and same-tier fixtures stay ~coin-flips, matching bookmaker-style spreads.
+# (Previously a fixed additive scale assumed the ~1000 magnitude and collapsed to
+# a <2-point spread once the API began returning the tiny 2-5 tiers -> every
+# fixture read an identical ~47% home. See SPEC 'How the confidence % works'.)
+ELO_SEED_SPREAD = 25.0       # Elo points per 1 std-dev of the strength proxy
 ELO_K = 20.0                 # Elo update step size
 ELO_HOME_ADV = 60.0          # home side gets +60 Elo when computing expectation
 ELO_DIV = 400.0             # standard Elo logistic divisor
@@ -115,29 +125,71 @@ def _soft_cap(x: float, cap: float) -> float:
 
 
 # ============================ (a) Elo ============================
-def seed_elo(teams: list[dict]) -> dict[int, float]:
-    """Seed each team's Elo from bootstrap `strength_overall_home/away`.
+def _strength_proxy(teams: list[dict]) -> dict[int, float]:
+    """Best available *differentiated* per-team strength signal (preseason-safe).
 
-    Uses the average overall strength as an early-season proxy: teams above the
-    league mean start above 1500, weakest sides land near ELO_PROMOTED.
+    Tries sources in priority order and returns the first one that actually
+    varies across the league (>=2 distinct positive values):
+
+      1. coarse overall tiers  (strength_overall_home + strength_overall_away)/2
+      2. the single 1-5 `strength` tier
+      3. granular attack/defence  (mean of the four attack/defence fields)
+
+    Preseason the FPL API zeroes the granular attack/defence fields and nulls
+    `strength`, leaving only the overall tiers populated — so source 1 is what
+    carries the signal. Returns a value for EVERY team (0.0 where a team has no
+    signal in the chosen source); returns {} only if NOTHING differentiates.
     """
-    overalls: dict[int, float] = {}
-    for t in teams:
-        home = _f(t.get("strength_overall_home"))
-        away = _f(t.get("strength_overall_away"))
-        overalls[t["id"]] = (home + away) / 2.0
+    def source(fn) -> Optional[dict[int, float]]:
+        vals = {t["id"]: fn(t) for t in teams}
+        nonzero = [v for v in vals.values() if v > 0]
+        # need at least two teams with real, non-identical values to be useful
+        if len(nonzero) < 2 or (max(nonzero) - min(nonzero)) <= 0:
+            return None
+        return vals
 
-    vals = [v for v in overalls.values() if v > 0]
-    mean = sum(vals) / len(vals) if vals else 0.0
+    candidates = (
+        lambda t: (_f(t.get("strength_overall_home")) + _f(t.get("strength_overall_away"))) / 2.0,
+        lambda t: _f(t.get("strength")),
+        lambda t: (
+            _f(t.get("strength_attack_home")) + _f(t.get("strength_attack_away"))
+            + _f(t.get("strength_defence_home")) + _f(t.get("strength_defence_away"))
+        ) / 4.0,
+    )
+    for fn in candidates:
+        vals = source(fn)
+        if vals is not None:
+            return vals
+    return {}
+
+
+def seed_elo(teams: list[dict]) -> dict[int, float]:
+    """Seed each team's Elo from the best differentiated bootstrap strength signal.
+
+    The proxy (see `_strength_proxy`) is z-scored across the league and mapped to
+    Elo at ELO_SEED_SPREAD points per standard deviation, clamped to
+    [ELO_PROMOTED, ELO_STRONG]. Because it standardises by the league's own
+    spread, seeding produces a real ratings gradient whether the API exposes the
+    coarse 2-5 tiers (preseason) or the fine ~1000 scale (mid-season). Teams with
+    no signal — or a completely flat league — fall back to ELO_BASE.
+    """
+    proxy = _strength_proxy(teams)
+    if not proxy:
+        # nothing differentiates the league (e.g. all strengths zero) -> flat
+        return {t["id"]: ELO_BASE for t in teams}
+
+    vals = [v for v in proxy.values() if v > 0]
+    mean = sum(vals) / len(vals)
+    sd = math.sqrt(sum((v - mean) ** 2 for v in vals) / len(vals))
 
     elo: dict[int, float] = {}
-    for tid, ov in overalls.items():
-        if ov <= 0 or mean <= 0:
-            elo[tid] = ELO_BASE
+    for t in teams:
+        v = proxy.get(t["id"], 0.0)
+        if v <= 0 or sd <= 0:
+            elo[t["id"]] = ELO_BASE
         else:
-            seeded = ELO_BASE + ELO_SEED_SCALE * (ov - mean)
-            # don't let a proxy pull anyone below the promoted floor
-            elo[tid] = max(ELO_PROMOTED, seeded)
+            seeded = ELO_BASE + ELO_SEED_SPREAD * (v - mean) / sd
+            elo[t["id"]] = _clamp(seeded, ELO_PROMOTED, ELO_STRONG)
     return elo
 
 
@@ -438,6 +490,32 @@ if __name__ == "__main__":
     elo = seed_elo(teams)
     assert elo[1] > elo[3] > elo[2], f"seeding order wrong: {elo}"
 
+    # --- preseason regression: the granular attack/defence fields are ZERO and
+    # `strength` is null; only the coarse 2-5 overall tiers carry a signal. Seeding
+    # MUST still differentiate (the "every fixture ~47%" bug was a flat seed here).
+    preseason = [
+        {"id": 1, "strength": None, "strength_overall_home": 4, "strength_overall_away": 5,
+         "strength_attack_home": 0, "strength_attack_away": 0,
+         "strength_defence_home": 0, "strength_defence_away": 0},   # top tier
+        {"id": 2, "strength": None, "strength_overall_home": 3, "strength_overall_away": 3,
+         "strength_attack_home": 0, "strength_attack_away": 0,
+         "strength_defence_home": 0, "strength_defence_away": 0},   # mid tier
+        {"id": 3, "strength": None, "strength_overall_home": 2, "strength_overall_away": 2,
+         "strength_attack_home": 0, "strength_attack_away": 0,
+         "strength_defence_home": 0, "strength_defence_away": 0},   # promoted / weakest
+    ]
+    pelo = seed_elo(preseason)
+    assert pelo[1] > pelo[2] > pelo[3], f"preseason tiers not differentiated: {pelo}"
+    assert (pelo[1] - pelo[3]) > 20.0, f"preseason spread too small: {pelo}"
+    # top-tier home vs weakest away must read as a clear favourite, not a coin-flip
+    pstr = team_strengths_from_elo(pelo)
+    p_top = poisson_match_probs(*expected_goals(1, 3, pstr))
+    assert p_top["p_home"] > 0.6, f"top-vs-weak home should be >60%, got {p_top['p_home']:.3f}"
+    # a completely flat league (all strengths zero) must degrade gracefully to base
+    flat = [{"id": i, "strength_overall_home": 0, "strength_overall_away": 0} for i in (1, 2, 3)]
+    felo = seed_elo(flat)
+    assert set(felo.values()) == {ELO_BASE}, f"flat league should seed to base: {felo}"
+
     finished = [
         {"fpl_id": 10, "kickoff": "2025-08-16T14:00:00Z",
          "home_team": 2, "away_team": 1, "home_score": 0, "away_score": 3},
@@ -527,6 +605,8 @@ if __name__ == "__main__":
 
     print("OK  models.py self-check passed")
     print(f"  seeded Elo:        {{1:{elo[1]:.0f}, 2:{elo[2]:.0f}, 3:{elo[3]:.0f}}}")
+    print(f"  preseason tiers:   elo {{4:{pelo[1]:.0f}, 3:{pelo[2]:.0f}, 2:{pelo[3]:.0f}}} "
+          f"-> top-vs-weak p_home={p_top['p_home']:.3f} (was flat ~0.465)")
     print(f"  Elo after 0-3:     {{1:{elo2[1]:.0f}, 2:{elo2[2]:.0f}}}")
     print(f"  fixtures checked:  {checked} (all probs summed to 1.000 +/- 1e-3)")
     print(f"  1 vs 2 probs:      p_home={p12['p_home']:.3f} "
