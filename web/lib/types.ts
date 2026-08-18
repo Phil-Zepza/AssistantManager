@@ -259,6 +259,16 @@ export type LmsEntryStatus = "alive" | "out";
 export type LmsReserveStrategy = "safest" | "manual" | "smart";
 export type LmsPickResult = "pending" | "survived" | "eliminated";
 
+// Cross-entry variance ("Spread picks across entries"). See db/migrations/005 and
+// computeCompetitionPlan in lib/lmsPlanner.ts.
+//   off    — each entry independently takes its safest (PR A behaviour).
+//   soft   — coordinate distinct teams that still clear each entry's confidence_floor.
+//   strong — coordinate distinct teams with no floor.
+export type LmsSpreadMode = "off" | "soft" | "strong";
+// Per-pick provenance: 'spread' (differs from pure-safest due to coordination),
+// 'matched' (duplicates a sibling / collapsed), or null (no spread effect).
+export type LmsSpreadSource = "spread" | "matched" | null;
+
 // Row shapes (mirror the migration/schema tables EXACTLY).
 export interface LmsCompetition {
   id: number;
@@ -267,6 +277,15 @@ export interface LmsCompetition {
   start_gw: number;
   notes: string | null;
   created_at: string;
+  spread_mode: LmsSpreadMode;
+  spread_floor_soft: number; // numeric — MUST be Number()-coerced in the query layer
+}
+
+// A per-round "use the same team across entries" override (lms_competition_spread_overrides).
+export interface LmsCompetitionSpreadOverride {
+  competition_id: number;
+  gw: number;
+  force_same: boolean;
 }
 
 export interface LmsCompetitionDeadline {
@@ -292,6 +311,7 @@ export interface LmsEntryPickRow {
   team_id: number;
   result: LmsPickResult;
   is_backfill: boolean;
+  spread_source: LmsSpreadSource;
 }
 
 export interface LmsEntryReserve {
@@ -331,6 +351,8 @@ export interface LmsCompetitionDetail {
   startGw: number;
   notes: string | null;
   entries: LmsEntrySummary[];
+  spreadMode: LmsSpreadMode;
+  spreadFloorSoft: number;
 }
 
 // One submitted pick joined with its team for display.
@@ -339,6 +361,30 @@ export interface LmsEntryPickView {
   team: Team | null;
   result: LmsPickResult;
   isBackfill: boolean;
+  spreadSource: LmsSpreadSource;
+}
+
+// One entry's chosen (locked) / planned (spread engine) team for a single round,
+// feeding PR D's cross-entry awareness row + duplicate detection.
+export interface LmsSpreadEntryView {
+  entryId: number;
+  label: string;
+  status: LmsEntryStatus;
+  chosenTeam: Team | null; // locked pick for this round, if any
+  plannedTeam: Team | null; // computeCompetitionPlan's team for this round
+  plannedSpreadSource: LmsSpreadSource;
+}
+
+// The cross-entry picture for one round of a competition.
+export interface LmsCompetitionSpreadView {
+  competitionId: number;
+  gw: number;
+  spreadMode: LmsSpreadMode;
+  forceSame: boolean; // an override row exists (force_same=true) for this round
+  entries: LmsSpreadEntryView[];
+  // Team ids backed by more than one alive entry this round (chosen or planned) —
+  // the duplicates the awareness row flags.
+  duplicateTeamIds: number[];
 }
 
 // One team with its single-use availability for this entry.

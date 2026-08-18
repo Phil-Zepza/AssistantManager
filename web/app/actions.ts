@@ -9,7 +9,14 @@ import { getCurrentGw } from "@/lib/gameweek";
 import { getEntryPicks } from "@/lib/fpl";
 import { ONBOARDING_SKIP_COOKIE } from "@/lib/onboarding";
 import { validateSquad, type SquadMember } from "@/lib/squad";
-import type { LmsEntryStatus, Position, SquadSelection } from "@/lib/types";
+import type {
+  LmsEntryStatus,
+  LmsSpreadMode,
+  LmsSpreadSource,
+  Position,
+  SquadSelection,
+} from "@/lib/types";
+import { autoSoftApplies } from "@/lib/lmsPlanner";
 
 // Send a magic-link email via the Resend provider. Returns a status object so
 // the login page can show "check your email" without a full-page redirect.
@@ -309,6 +316,19 @@ function isReserveStrategy(
   );
 }
 
+const SPREAD_MODES = ["off", "soft", "strong"] as const;
+function isSpreadMode(s: unknown): s is LmsSpreadMode {
+  return typeof s === "string" && (SPREAD_MODES as readonly string[]).includes(s);
+}
+
+const SPREAD_SOURCES = ["spread", "matched"] as const;
+// Accepts 'spread' | 'matched' | null | undefined (the last two -> null).
+function normalizeSpreadSource(s: unknown): LmsSpreadSource {
+  return typeof s === "string" && (SPREAD_SOURCES as readonly string[]).includes(s)
+    ? (s as LmsSpreadSource)
+    : null;
+}
+
 // Ownership guard: load an entry only if its competition belongs to userId.
 async function loadOwnedEntry(
   userId: number,
@@ -460,13 +480,37 @@ export async function addEntry(
     return { ok: false, error: "Competition not found." };
   }
 
-  const res = await q<{ id: number }>(
-    `insert into lms_entries (competition_id, label, reserve_strategy)
-       values ($1, $2, $3) returning id`,
-    [compId, cleanLabel, mode],
-  );
+  let entryId = 0;
+  await tx(async (client) => {
+    const res = await client.query(
+      `insert into lms_entries (competition_id, label, reserve_strategy)
+         values ($1, $2, $3) returning id`,
+      [compId, cleanLabel, mode],
+    );
+    entryId = res.rows[0].id as number;
+
+    // Auto-Soft on the 2nd entry: when adding an entry takes a competition from
+    // 1 -> 2 entries and its spread_mode is still 'off', default it to 'soft'.
+    // Decision lives in the pure, unit-tested autoSoftApplies(); it never lowers an
+    // explicit 'soft'/'strong' choice and fires only at exactly 2 entries (so a re-run
+    // at 3+ is a no-op). Read count + mode in the same tx as the insert for consistency.
+    const stateRows = await client.query(
+      `select (select count(*) from lms_entries e where e.competition_id = $1)::int as n,
+              (select spread_mode from lms_competitions where id = $1) as mode`,
+      [compId],
+    );
+    const n = Number(stateRows.rows[0].n);
+    const currentMode = stateRows.rows[0].mode as LmsSpreadMode;
+    if (autoSoftApplies(n, currentMode)) {
+      await client.query(
+        `update lms_competitions set spread_mode = 'soft' where id = $1`,
+        [compId],
+      );
+    }
+  });
+
   revalidatePath("/lms");
-  return { ok: true, entryId: res[0].id };
+  return { ok: true, entryId };
 }
 
 // Record + lock the current round's pick for an entry. THE single lock write.
@@ -478,6 +522,7 @@ export async function submitPick(
   entryId: number,
   gw: number,
   teamId: number,
+  spreadSource?: LmsSpreadSource,
 ): Promise<{ ok: boolean; error?: string }> {
   const session = await auth();
   const userId = session?.user?.id;
@@ -486,6 +531,8 @@ export async function submitPick(
   const eId = Number(entryId);
   const roundGw = Number(gw);
   const team = Number(teamId);
+  // Provenance from the recomputed plan (PR D). Anything unrecognised -> null.
+  const source = normalizeSpreadSource(spreadSource);
   if (!Number.isInteger(eId) || eId <= 0) return { ok: false, error: "Invalid entry." };
   if (!Number.isInteger(roundGw) || roundGw <= 0) {
     return { ok: false, error: "Invalid round." };
@@ -540,9 +587,9 @@ export async function submitPick(
   }
 
   await q(
-    `insert into lms_entry_picks (entry_id, gw, team_id, result, is_backfill)
-       values ($1, $2, $3, 'pending', false)`,
-    [eId, roundGw, team],
+    `insert into lms_entry_picks (entry_id, gw, team_id, result, is_backfill, spread_source)
+       values ($1, $2, $3, 'pending', false, $4)`,
+    [eId, roundGw, team, source],
   );
   revalidatePath("/lms");
   return { ok: true };
@@ -672,6 +719,79 @@ export async function setRoundDeadline(
        on conflict (competition_id, gw) do update set deadline = excluded.deadline`,
     [compId, roundGw, value],
   );
+  revalidatePath("/lms");
+  return { ok: true };
+}
+
+// Set a competition's cross-entry spread mode ('off' | 'soft' | 'strong'). This
+// is the explicit user choice; addEntry's auto-Soft default never overrides it.
+export async function setSpreadMode(
+  competitionId: number,
+  mode: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const session = await auth();
+  const userId = session?.user?.id;
+  if (!userId) throw new Error("Not authenticated");
+
+  const compId = Number(competitionId);
+  if (!Number.isInteger(compId) || compId <= 0) {
+    return { ok: false, error: "Invalid competition." };
+  }
+  if (!isSpreadMode(mode)) {
+    return { ok: false, error: "Invalid spread mode." };
+  }
+  if (!(await competitionOwned(userId, compId))) {
+    return { ok: false, error: "Competition not found." };
+  }
+
+  await q(`update lms_competitions set spread_mode = $1 where id = $2`, [
+    mode,
+    compId,
+  ]);
+  revalidatePath("/lms");
+  return { ok: true };
+}
+
+// Set (or clear) a round's force_same override for a competition. forceSame=true
+// upserts the override (collapse the round to one team across entries, any mode);
+// forceSame=false clears it (delete the row), returning the round to normal
+// mode-driven allocation. Nothing about picks is persisted here — PR D recomputes
+// the plan live; only submitPick locks a round.
+export async function setSpreadOverride(
+  competitionId: number,
+  gw: number,
+  forceSame: boolean,
+): Promise<{ ok: boolean; error?: string }> {
+  const session = await auth();
+  const userId = session?.user?.id;
+  if (!userId) throw new Error("Not authenticated");
+
+  const compId = Number(competitionId);
+  const roundGw = Number(gw);
+  if (!Number.isInteger(compId) || compId <= 0) {
+    return { ok: false, error: "Invalid competition." };
+  }
+  if (!Number.isInteger(roundGw) || roundGw <= 0) {
+    return { ok: false, error: "Invalid round." };
+  }
+  if (!(await competitionOwned(userId, compId))) {
+    return { ok: false, error: "Competition not found." };
+  }
+
+  if (forceSame) {
+    await q(
+      `insert into lms_competition_spread_overrides (competition_id, gw, force_same)
+         values ($1, $2, true)
+         on conflict (competition_id, gw) do update set force_same = excluded.force_same`,
+      [compId, roundGw],
+    );
+  } else {
+    await q(
+      `delete from lms_competition_spread_overrides
+        where competition_id = $1 and gw = $2`,
+      [compId, roundGw],
+    );
+  }
   revalidatePath("/lms");
   return { ok: true };
 }
