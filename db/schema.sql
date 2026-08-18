@@ -4,6 +4,15 @@
 -- DB directly — only the Next.js server (and the pipeline) connect. Access is scoped in the
 -- app/query layer by the logged-in user's id, so no RLS is required.
 
+-- ============ MIGRATION BOOKKEEPING ============
+-- Tracks which ordered files in db/migrations/*.sql have been applied. The
+-- migration runner (db/migrate.sh / `npm run migrate`) also creates this if
+-- absent; it is declared here so the structural source of truth is complete.
+create table if not exists schema_migrations (
+  filename   text primary key,
+  applied_at timestamptz not null default now()
+);
+
 -- ============ AUTH.JS (@auth/pg-adapter) TABLES ============
 -- Column names/types must match the adapter exactly (note quoted camelCase identifiers).
 -- The users table is EXTENDED with app columns (fpl_entry_id, display_name).

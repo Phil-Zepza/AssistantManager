@@ -5,6 +5,7 @@
     "dockerfilePath": "pipeline/Dockerfile"
   },
   "deploy": {
+    "preDeployCommand": "sh db/migrate.sh",
     "cronSchedule": "0 6 * * *",
     "restartPolicyType": "NEVER"
   }

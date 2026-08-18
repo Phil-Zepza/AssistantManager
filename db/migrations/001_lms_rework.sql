@@ -1,16 +1,16 @@
 -- db/migrations/001_lms_rework.sql
 -- LMS rework: competitions / entries / per-entry picks + reserves + deadlines.
 --
--- IDEMPOTENT. Safe to run repeatedly against an already-seeded staging DB:
---     psql "$DATABASE_URL" -f db/migrations/001_lms_rework.sql
+-- IDEMPOTENT. Applied by the migration runner (see db/migrate.sh / `npm run
+-- migrate`), which wraps THIS FILE in a single transaction and records it in
+-- schema_migrations on success. Do not add BEGIN/COMMIT here — the runner owns
+-- the transaction. (It can still be applied by hand for ad-hoc use with:
+--     psql "$DATABASE_URL" --single-transaction -f db/migrations/001_lms_rework.sql )
 --
--- This is a NEW pattern for this repo (no db/migrations dir existed before).
 -- db/schema.sql remains the structural source of truth: the create-table/index
 -- blocks below are mirrored verbatim into schema.sql. The BACKFILL section
 -- (part 3) lives ONLY here. This migration does NOT drop/alter the deprecated
 -- lms_picks table and NEVER touches the generated column gameweeks.lms_eligible.
-
-begin;
 
 -- ============ 1. NEW TABLES (mirrored into db/schema.sql) ============
 -- teams PK is fpl_id (NOT id), so team_id FKs -> teams(fpl_id).
@@ -161,5 +161,3 @@ from (
 where e.competition_id = sub.competition_id
   and e.label = 'Entry 1'
   and e.status <> 'out';
-
-commit;
