@@ -5,6 +5,7 @@ import {
   getAllTeams,
   getCompetitions,
   getCompetition,
+  getCompetitionSpreadView,
   getEntry,
   getGameweekFixtures,
   getForwardPlanInputs,
@@ -57,15 +58,20 @@ export default async function LmsPage({
       ];
       const teamStats = await getTeamScouting(teamIds);
 
-      const entriesData = await Promise.all(
-        comp.entries.map(async (e) => {
-          const [detail, planInputs] = await Promise.all([
-            getEntry(e.id, userId),
-            getForwardPlanInputs(e.id, userId),
-          ]);
-          return { detail, planInputs };
-        }),
-      );
+      const [entriesData, spreadView] = await Promise.all([
+        Promise.all(
+          comp.entries.map(async (e) => {
+            const [detail, planInputs] = await Promise.all([
+              getEntry(e.id, userId),
+              getForwardPlanInputs(e.id, userId),
+            ]);
+            return { detail, planInputs };
+          }),
+        ),
+        currentGw != null
+          ? getCompetitionSpreadView(compIdParam, userId, currentGw)
+          : Promise.resolve(null),
+      ]);
 
       const entries = entriesData.filter(
         (e): e is { detail: NonNullable<typeof e.detail>; planInputs: typeof e.planInputs } =>
@@ -79,6 +85,7 @@ export default async function LmsPage({
         teamStats,
         currentGw,
         firstEntryId: comp.entries[0]?.id ?? 0,
+        spreadView,
       };
     }
   }

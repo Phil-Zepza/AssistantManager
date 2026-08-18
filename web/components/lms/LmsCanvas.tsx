@@ -26,11 +26,16 @@ import {
 } from "@/components/ui";
 import {
   computeForwardPlan,
+  computeCompetitionPlan,
   computeDefaultDeadline,
+  type CompetitionPlan,
   type ForwardPlan,
+  type PlannedPick,
   type PlannerPin,
   type PlannerFixtureProb,
   type PlannerTeam,
+  type SpreadPlannedPick,
+  type SpreadSource,
 } from "@/lib/lmsPlanner";
 import {
   createCompetition,
@@ -39,16 +44,20 @@ import {
   setStrategy,
   setReserves,
   setRoundDeadline,
+  setSpreadMode,
+  setSpreadOverride,
 } from "@/app/actions";
 import { formatPct } from "@/lib/format";
 import { deriveGwStatus, GW_STATUS_LABEL } from "@/lib/lmsStatus";
 import type {
   LmsCompetitionDetail,
+  LmsCompetitionSpreadView,
   LmsCompetitionSummary,
   LmsEntryDetail,
   LmsGameweekFixture,
   LmsGwStatus,
   LmsReserveStrategy,
+  LmsSpreadMode,
   Team,
   TeamScouting,
 } from "@/lib/types";
@@ -68,6 +77,7 @@ export type LmsCompDetail = {
   teamStats: TeamScouting[];
   currentGw: number | null;
   firstEntryId: number;
+  spreadView: LmsCompetitionSpreadView | null;
 };
 
 export interface LmsCanvasProps {
@@ -324,6 +334,12 @@ export function LmsCanvas({
   const [reserveIds, setReserveIds] = useState<number[]>([]);
   const [strategySaving, setStrategySaving] = useState(false);
 
+  // Competition-scoped spread mode (optimistic)
+  const [spreadMode, setSpreadModeLocal] = useState<LmsSpreadMode>(
+    compDetail?.competition.spreadMode ?? "off",
+  );
+  const [spreadSaving, setSpreadSaving] = useState(false);
+
   // Modal / sheet states
   const [addCompOpen, setAddCompOpen] = useState(false);
   const [addEntryOpen, setAddEntryOpen] = useState(false);
@@ -339,6 +355,14 @@ export function LmsCanvas({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [compDetail?.competition.id]);
+
+  // Sync spread mode from server when competition or its spread_mode changes
+  useEffect(() => {
+    if (compDetail) {
+      setSpreadModeLocal(compDetail.competition.spreadMode);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [compDetail?.competition.id, compDetail?.competition.spreadMode]);
 
   const selectedEntry =
     compDetail?.entries.find((e) => e.detail.id === selectedEntryId) ??
@@ -371,6 +395,28 @@ export function LmsCanvas({
       pins,
     });
   }, [planInputs, strategyMode, floorPct, reserveIds, pins]);
+
+  // Cross-entry competition plan — only when ≥2 alive entries
+  const competitionPlan = useMemo((): CompetitionPlan | null => {
+    if (!planInputs || planInputs.aliveEntries.length < 2) return null;
+    return computeCompetitionPlan({
+      entries: planInputs.aliveEntries.map((e) => ({
+        ...e,
+        pins: e.entryId === selectedEntryId ? pins : undefined,
+      })),
+      upcomingRounds: planInputs.upcomingRounds,
+      fixtureProbs: planInputs.fixtureProbs,
+      teams: planInputs.teams,
+      eliteSet: planInputs.eliteSet,
+      spreadMode: spreadMode as "off" | "soft" | "strong",
+      spreadFloorSoft: compDetail?.competition.spreadFloorSoft ?? 0.65,
+      overrides: planInputs.spreadOverrides,
+    });
+  }, [planInputs, selectedEntryId, pins, spreadMode, compDetail?.competition.spreadFloorSoft]);
+
+  // Spread picks for the currently selected entry from the competition plan
+  const selectedSpreadPicks = competitionPlan?.entries
+    .find((e) => e.entryId === selectedEntryId)?.picks ?? null;
 
   const usedTeamIds = selectedEntry?.detail.usedTeamIds ?? [];
 
@@ -420,6 +466,26 @@ export function LmsCanvas({
       : [...reserveIds, teamId];
     setReserveIds(next);
     await setReserves(selectedEntry.detail.id, next);
+    router.refresh();
+  }
+
+  // ── Spread handlers ───────────────────────────────────────────────────────
+
+  async function handleSpreadMode(mode: LmsSpreadMode) {
+    if (!compDetail) return;
+    setSpreadModeLocal(mode);
+    setSpreadSaving(true);
+    try {
+      await setSpreadMode(compDetail.competition.id, mode);
+      router.refresh();
+    } finally {
+      setSpreadSaving(false);
+    }
+  }
+
+  async function handleSpreadOverride(gw: number, forceSame: boolean) {
+    if (!compDetail) return;
+    await setSpreadOverride(compDetail.competition.id, gw, forceSame);
     router.refresh();
   }
 
@@ -525,17 +591,25 @@ export function LmsCanvas({
             rankedPicks={rankedPicks}
             teamStatsById={teamStatsById}
             canPick={canPick}
+            spreadView={compDetail.spreadView}
+            selectedEntryId={selectedEntryId}
             onBackPick={(pick) => setConfirmPick(pick)}
           />
 
           {plan && (
             <ForwardPlanSection
               plan={plan}
+              spreadPicks={selectedSpreadPicks}
               planInputs={planInputs!}
               pins={pins}
               usedTeamIds={usedTeamIds}
+              currentGw={currentGw}
+              spreadMode={spreadMode}
+              spreadFloorSoft={compDetail.competition.spreadFloorSoft}
+              autoCollapsedGws={competitionPlan?.autoCollapsedGws ?? []}
               onTileClick={(gw) => setOverrideGw(gw)}
               onClearPin={handleClearPin}
+              onSpreadOverride={handleSpreadOverride}
             />
           )}
 
@@ -546,10 +620,15 @@ export function LmsCanvas({
               floorPct={floorPct}
               reserveIds={reserveIds}
               saving={strategySaving}
+              spreadMode={spreadMode}
+              spreadSaving={spreadSaving}
+              totalEntryCount={compDetail.competition.entries.length}
               onStrategyChange={handleStrategyChange}
               onFloorChange={setFloorPct}
               onFloorCommit={handleFloorCommit}
               onReserveToggle={handleReserveToggle}
+              onSpreadModeChange={handleSpreadMode}
+              onAddEntry={() => setAddEntryOpen(true)}
             />
           )}
 
@@ -564,6 +643,9 @@ export function LmsCanvas({
         open={addEntryOpen}
         onClose={() => setAddEntryOpen(false)}
         competitionId={compDetail.competition.id}
+        willAutoSoft={
+          compDetail.competition.entries.length === 1 && spreadMode === "off"
+        }
         onAdded={() => {
           setAddEntryOpen(false);
           router.refresh();
@@ -1113,14 +1195,51 @@ function Top3Section({
   rankedPicks,
   teamStatsById,
   canPick,
+  spreadView,
+  selectedEntryId,
   onBackPick,
 }: {
   currentGw: number | null;
   rankedPicks: RankedPick[];
   teamStatsById: Map<number, TeamScouting>;
   canPick: boolean;
+  spreadView: LmsCompetitionSpreadView | null;
+  selectedEntryId: number;
   onBackPick: (pick: RankedPick) => void;
 }) {
+  // Siblings: alive entries other than the currently selected one
+  const siblings =
+    spreadView != null
+      ? spreadView.entries.filter(
+          (e) => e.entryId !== selectedEntryId && e.status === "alive",
+        )
+      : [];
+
+  // Team ids held by any sibling this round (chosen > planned priority)
+  const siblingTeamIds = new Set(
+    siblings
+      .map((e) => (e.chosenTeam ?? e.plannedTeam)?.fpl_id)
+      .filter((id): id is number => id != null),
+  );
+
+  const topPickTeamId = rankedPicks[0]?.team.fpl_id;
+  const topPickDuplicatesSibling =
+    topPickTeamId != null && siblingTeamIds.has(topPickTeamId);
+
+  // Which sibling holds the top pick?
+  const siblingWithTopPick = topPickDuplicatesSibling
+    ? siblings.find(
+        (e) =>
+          (e.chosenTeam?.fpl_id ?? e.plannedTeam?.fpl_id) === topPickTeamId,
+      )
+    : null;
+
+  // First ranked pick not held by any sibling (clean alternative)
+  const cleanAlternative =
+    topPickDuplicatesSibling
+      ? rankedPicks.slice(1).find((p) => !siblingTeamIds.has(p.team.fpl_id))
+      : null;
+
   return (
     <section className="mb-5">
       <h2 className="mb-2 text-sm font-semibold uppercase tracking-wider text-muted">
@@ -1143,9 +1262,72 @@ function Top3Section({
               rank={i + 1}
               canPick={canPick}
               scouting={teamStatsById.get(pick.team.fpl_id)}
+              isCleanAlternative={cleanAlternative?.fixtureId === pick.fixtureId}
               onBackPick={onBackPick}
             />
           ))}
+        </div>
+      )}
+
+      {/* Awareness row — show whenever ≥2 alive entries exist, any spread_mode */}
+      {siblings.length > 0 && (
+        <div className="mt-3 space-y-2">
+          {topPickDuplicatesSibling && (
+            <Callout tone="danger">
+              Your top pick duplicates{" "}
+              {siblingWithTopPick ? siblingWithTopPick.label : "another entry"} —
+              one slip-up takes out both lives; consider your #2
+              {cleanAlternative && (
+                <span className="block mt-1 text-xs">
+                  ✓ No other entry on this: {cleanAlternative.team.short_name}
+                </span>
+              )}
+            </Callout>
+          )}
+          <div className="flex flex-wrap items-center gap-2 rounded-lg border border-subtle bg-surface-2 px-3 py-2">
+            <span className="text-xs font-medium text-muted shrink-0">
+              Also this round · your other entries
+            </span>
+            {siblings.map((e) => {
+              const team = e.chosenTeam ?? e.plannedTeam;
+              const isDuplicate =
+                team != null && siblingTeamIds.size > 0
+                  ? spreadView?.duplicateTeamIds.includes(team.fpl_id) ?? false
+                  : false;
+              return (
+                <span
+                  key={e.entryId}
+                  className="flex items-center gap-1.5 text-xs"
+                >
+                  <span className="text-secondary">{e.label}</span>
+                  <span className="text-muted">→</span>
+                  {team ? (
+                    <>
+                      <ClubBadge
+                        code={team.short_name}
+                        size={24}
+                        ring={isDuplicate ? "var(--danger)" : undefined}
+                      />
+                      <span
+                        className={
+                          isDuplicate ? "font-semibold text-danger" : "text-primary"
+                        }
+                      >
+                        {team.short_name}
+                        {e.chosenTeam != null && (
+                          <span className="ml-0.5 text-[10px] text-muted">
+                            {" "}locked
+                          </span>
+                        )}
+                      </span>
+                    </>
+                  ) : (
+                    <span className="text-muted">—</span>
+                  )}
+                </span>
+              );
+            })}
+          </div>
         </div>
       )}
     </section>
@@ -1157,12 +1339,14 @@ function PickCard({
   rank,
   canPick,
   scouting,
+  isCleanAlternative,
   onBackPick,
 }: {
   pick: RankedPick;
   rank: number;
   canPick: boolean;
   scouting: TeamScouting | undefined;
+  isCleanAlternative?: boolean;
   onBackPick: (pick: RankedPick) => void;
 }) {
   const venue = pick.isHome ? "H" : "A";
@@ -1176,7 +1360,12 @@ function PickCard({
             <span className="text-xl font-bold text-muted">v</span>
             <ClubBadge code={pick.opponent?.short_name} size={44} />
           </div>
-          <Badge tone="accent">#1 · Safest banker</Badge>
+          <div className="flex flex-col items-end gap-1">
+            <Badge tone="accent">#1 · Safest banker</Badge>
+            {isCleanAlternative && (
+              <Badge tone="success">✓ No other entry on this</Badge>
+            )}
+          </div>
         </div>
 
         <div className="flex items-end justify-between gap-3 mb-3">
@@ -1237,6 +1426,9 @@ function PickCard({
           </span>
           <span className="text-[11px] text-muted">win</span>
         </span>
+        {isCleanAlternative && (
+          <Badge tone="success">✓ No other entry</Badge>
+        )}
         {canPick && (
           <Button size="sm" variant="secondary" onClick={() => onBackPick(pick)}>
             Back
@@ -1254,22 +1446,66 @@ function PickCard({
 
 // ─── Competition: forward plan ────────────────────────────────────────────────
 
+// Derive a spread marker for a tile from its spread pick
+function getSpreadMarker(
+  spreadPick: SpreadPlannedPick | undefined,
+  spreadMode: LmsSpreadMode,
+): "matched" | "spread" | "belowFloor" | undefined {
+  if (!spreadPick) return undefined;
+  if (spreadPick.spreadSource === "matched") return "matched";
+  if (spreadPick.spreadSource === "spread") {
+    if (spreadMode === "strong" && spreadPick.flags.includes("needsDeploy")) {
+      return "belowFloor";
+    }
+    return "spread";
+  }
+  return undefined;
+}
+
 function ForwardPlanSection({
   plan,
+  spreadPicks,
   planInputs,
   pins,
   usedTeamIds,
+  currentGw,
+  spreadMode,
+  spreadFloorSoft,
+  autoCollapsedGws,
   onTileClick,
   onClearPin,
+  onSpreadOverride,
 }: {
   plan: ForwardPlan;
+  spreadPicks: SpreadPlannedPick[] | null;
   planInputs: ForwardPlanInputs;
   pins: PlannerPin[];
   usedTeamIds: number[];
+  currentGw: number | null;
+  spreadMode: LmsSpreadMode;
+  spreadFloorSoft: number;
+  autoCollapsedGws: number[];
   onTileClick: (gw: number) => void;
   onClearPin: (gw: number) => void;
+  onSpreadOverride: (gw: number, forceSame: boolean) => void;
 }) {
   const teamById = new Map(planInputs.teams.map((t) => [t.id, t]));
+
+  // When we have a competition plan, use its picks (may pick different teams)
+  const picks: PlannedPick[] = spreadPicks ?? plan.picks;
+  const spreadPicksByGw = new Map(spreadPicks?.map((p) => [p.gw, p]) ?? []);
+
+  // Per-round override state for current GW
+  const isAutoCollapsed =
+    currentGw != null && autoCollapsedGws.includes(currentGw);
+  const isManualOverride =
+    currentGw != null &&
+    planInputs.spreadOverrides.some(
+      (o) => o.gw === currentGw && o.forceSame,
+    );
+  const forceSame = isAutoCollapsed || isManualOverride;
+  const showOverrideControl =
+    currentGw != null && spreadPicks != null; // ≥2 alive entries
 
   return (
     <section className="mb-5">
@@ -1282,22 +1518,60 @@ function ForwardPlanSection({
         </span>
       </div>
 
-      {plan.picks.length === 0 ? (
+      {showOverrideControl && (
+        <div className="mb-2 flex items-center justify-between rounded-lg border border-subtle bg-surface-2 px-3 py-2">
+          <span className="text-xs font-medium text-secondary">
+            Use same team across entries · GW{currentGw}
+          </span>
+          {isAutoCollapsed ? (
+            <Badge tone="gray">Auto (only one team cleared floor)</Badge>
+          ) : (
+            <button
+              type="button"
+              onClick={() =>
+                currentGw != null && onSpreadOverride(currentGw, !forceSame)
+              }
+              className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full border-2 border-transparent transition-colors duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent ${
+                forceSame
+                  ? "bg-accent"
+                  : "bg-surface-2 border-strong"
+              }`}
+              role="switch"
+              aria-checked={forceSame}
+              aria-label="Use same team across entries this round"
+            >
+              <span
+                className={`inline-block h-4 w-4 rounded-full bg-white shadow-sm transition-transform duration-200 ${
+                  forceSame ? "translate-x-4" : "translate-x-0"
+                }`}
+              />
+            </button>
+          )}
+        </div>
+      )}
+
+      {picks.length === 0 ? (
         <Card>
           <p className="text-sm text-secondary">No upcoming eligible rounds.</p>
         </Card>
       ) : (
         <div className="flex gap-2 overflow-x-auto pb-2">
-          {plan.picks.map((pick) => (
-            <PlanTile
-              key={pick.gw}
-              pick={pick}
-              teamById={teamById}
-              isPinned={pins.some((p) => p.gw === pick.gw)}
-              onClick={() => onTileClick(pick.gw)}
-              onClearPin={() => onClearPin(pick.gw)}
-            />
-          ))}
+          {picks.map((pick) => {
+            const spreadPick = spreadPicksByGw.get(pick.gw);
+            const spreadMarker = getSpreadMarker(spreadPick, spreadMode);
+            return (
+              <PlanTile
+                key={pick.gw}
+                pick={pick}
+                teamById={teamById}
+                spreadMarker={spreadMarker}
+                spreadFloorSoft={spreadFloorSoft}
+                isPinned={pins.some((p) => p.gw === pick.gw)}
+                onClick={() => onTileClick(pick.gw)}
+                onClearPin={() => onClearPin(pick.gw)}
+              />
+            );
+          })}
         </div>
       )}
 
@@ -1329,12 +1603,16 @@ function ForwardPlanSection({
 function PlanTile({
   pick,
   teamById,
+  spreadMarker,
+  spreadFloorSoft,
   isPinned,
   onClick,
   onClearPin,
 }: {
-  pick: ReturnType<typeof computeForwardPlan>["picks"][0];
+  pick: PlannedPick;
   teamById: Map<number, PlannerTeam>;
+  spreadMarker?: "matched" | "spread" | "belowFloor";
+  spreadFloorSoft?: number;
   isPinned: boolean;
   onClick: () => void;
   onClearPin: () => void;
@@ -1364,7 +1642,13 @@ function PlanTile({
   let labelColor = "text-muted";
   let tileIcon: React.ReactNode = null;
 
-  if (isEliteEarly) {
+  // Spread marker overrides card style
+  const isBelowFloor = spreadMarker === "belowFloor";
+
+  if (isBelowFloor) {
+    cardStyle = { boxShadow: "inset 0 0 0 1.5px var(--warning)" };
+    labelColor = "text-warning";
+  } else if (isEliteEarly) {
     cardStyle = { boxShadow: "inset 0 0 0 2px var(--accent-2)" };
     labelColor = "text-hot";
     tileIcon = <Zap className="h-3.5 w-3.5 text-hot" aria-hidden />;
@@ -1425,11 +1709,112 @@ function PlanTile({
       {isPinnedFlag && (
         <span className="mt-1 block text-[10px] text-accent">Tap to clear</span>
       )}
+
+      {/* Spread source markers */}
+      {spreadMarker === "matched" && (
+        <span className="mt-1 block text-[10px] font-medium text-accent">
+          Matched
+        </span>
+      )}
+      {spreadMarker === "spread" && (
+        <span className="mt-1 block text-[10px] font-medium text-success">
+          Spread
+        </span>
+      )}
+      {isBelowFloor && (
+        <span className="mt-1 block text-[10px] font-medium text-warning">
+          Below {Math.round((spreadFloorSoft ?? 0.65) * 100)}% floor
+        </span>
+      )}
     </button>
   );
 }
 
 // ─── Competition: strategy ────────────────────────────────────────────────────
+
+const SPREAD_MODE_INFO: Record<LmsSpreadMode, { blurb: string }> = {
+  off: { blurb: "Never spread — each entry picks its own safest team independently." },
+  soft: {
+    blurb:
+      "Diversify only among teams above the 65% floor — survival wins.",
+  },
+  strong: {
+    blurb:
+      "Next-best distinct team regardless of odds — can drop below 65%. Maximum spread.",
+  },
+};
+
+function SpreadControl({
+  spreadMode,
+  spreadSaving,
+  disabled,
+  onSpreadModeChange,
+  onAddEntry,
+}: {
+  spreadMode: LmsSpreadMode;
+  spreadSaving: boolean;
+  disabled: boolean;
+  onSpreadModeChange: (mode: LmsSpreadMode) => void;
+  onAddEntry: () => void;
+}) {
+  return (
+    <div>
+      <div className="mb-2 flex items-center gap-2">
+        <Badge tone="gray">COMPETITION</Badge>
+        <span className="text-xs text-muted">Spread coordination across entries</span>
+      </div>
+      {disabled ? (
+        <div className="rounded-lg border border-subtle bg-surface-2 p-3">
+          <p className="text-sm text-secondary opacity-60">
+            Spread needs at least two entries
+          </p>
+          <button
+            type="button"
+            onClick={onAddEntry}
+            className="mt-2 flex items-center gap-1 text-xs font-semibold text-accent hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent rounded"
+          >
+            <Plus className="h-3.5 w-3.5" aria-hidden /> Add an entry
+          </button>
+        </div>
+      ) : (
+        <>
+          <div
+            role="radiogroup"
+            aria-label="Spread mode"
+            className="flex w-full rounded-lg border border-subtle bg-raised p-1"
+          >
+            {(
+              [
+                { v: "off" as LmsSpreadMode, label: "Off", activeClass: "bg-surface-2 text-primary shadow-card" },
+                { v: "soft" as LmsSpreadMode, label: "Soft", activeClass: "bg-[rgba(22,225,163,0.12)] text-success shadow-card" },
+                { v: "strong" as LmsSpreadMode, label: "Strong", activeClass: "bg-[rgba(245,180,0,0.12)] text-warning shadow-card" },
+              ] as const
+            ).map(({ v, label, activeClass }) => (
+              <button
+                key={v}
+                type="button"
+                role="radio"
+                aria-checked={spreadMode === v}
+                onClick={() => onSpreadModeChange(v)}
+                className={`flex-1 h-9 rounded-md px-3.5 text-sm font-semibold transition-colors duration-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent ${
+                  spreadMode === v ? activeClass : "text-secondary hover:text-primary"
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <p className="mt-1.5 text-xs leading-relaxed text-secondary">
+            {SPREAD_MODE_INFO[spreadMode].blurb}
+          </p>
+          {spreadSaving && (
+            <p className="mt-1 text-xs text-muted">Saving…</p>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
 
 function StrategySection({
   entry,
@@ -1437,23 +1822,34 @@ function StrategySection({
   floorPct,
   reserveIds,
   saving,
+  spreadMode,
+  spreadSaving,
+  totalEntryCount,
   onStrategyChange,
   onFloorChange,
   onFloorCommit,
   onReserveToggle,
+  onSpreadModeChange,
+  onAddEntry,
 }: {
   entry: LmsEntryDetail;
   strategyMode: LmsReserveStrategy;
   floorPct: number;
   reserveIds: number[];
   saving: boolean;
+  spreadMode: LmsSpreadMode;
+  spreadSaving: boolean;
+  totalEntryCount: number;
   onStrategyChange: (mode: LmsReserveStrategy) => void;
   onFloorChange: (pct: number) => void;
   onFloorCommit: (pct: number) => void;
   onReserveToggle: (teamId: number) => void;
+  onSpreadModeChange: (mode: LmsSpreadMode) => void;
+  onAddEntry: () => void;
 }) {
   // Available teams for the manual reserve tray
   const availableForReserve = entry.teams.filter((t) => !t.used);
+  const spreadDisabled = totalEntryCount < 2;
 
   return (
     <section className="mb-5">
@@ -1462,7 +1858,19 @@ function StrategySection({
       </h2>
       <Card>
         <div className="space-y-4">
-          <div>
+          {/* Competition-scoped spread control */}
+          <SpreadControl
+            spreadMode={spreadMode}
+            spreadSaving={spreadSaving}
+            disabled={spreadDisabled}
+            onSpreadModeChange={onSpreadModeChange}
+            onAddEntry={onAddEntry}
+          />
+
+          <div className="border-t border-subtle pt-4">
+            <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-muted">
+              Entry reserve strategy
+            </p>
             <SegmentedControl
               aria-label="Reserve strategy"
               options={STRATEGY_OPTIONS}
@@ -1975,22 +2383,26 @@ function AddEntrySheet({
   open,
   onClose,
   competitionId,
+  willAutoSoft,
   onAdded,
 }: {
   open: boolean;
   onClose: () => void;
   competitionId: number;
+  willAutoSoft: boolean;
   onAdded: () => void;
 }) {
   const [label, setLabel] = useState("");
   const [strategy, setStrategyLocal] = useState<LmsReserveStrategy>("smart");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [showSoftHint, setShowSoftHint] = useState(false);
 
   function reset() {
     setLabel("");
     setStrategyLocal("smart");
     setError(null);
+    setShowSoftHint(false);
   }
 
   async function handleSubmit() {
@@ -2004,8 +2416,12 @@ function AddEntrySheet({
     try {
       const res = await addEntry(competitionId, l, strategy);
       if (res.ok) {
-        reset();
-        onAdded();
+        if (willAutoSoft) {
+          setShowSoftHint(true);
+        } else {
+          reset();
+          onAdded();
+        }
       } else {
         setError(res.error ?? "Could not add entry.");
       }
@@ -2016,49 +2432,66 @@ function AddEntrySheet({
     }
   }
 
+  function handleSoftHintContinue() {
+    reset();
+    onAdded();
+  }
+
   return (
     <BottomSheet
       open={open}
       onClose={() => { reset(); onClose(); }}
       title="Add Entry"
     >
-      <div className="space-y-4">
-        <Input
-          label="Entry label"
-          placeholder="Entry 2"
-          value={label}
-          onChange={(e) => setLabel(e.target.value)}
-        />
-
-        <div>
-          <label className="mb-1.5 block text-sm font-medium text-secondary">
-            Reserve strategy
-          </label>
-          <SegmentedControl
-            aria-label="Reserve strategy"
-            options={STRATEGY_OPTIONS}
-            value={strategy}
-            onValueChange={(v) => setStrategyLocal(v as LmsReserveStrategy)}
-            fullWidth
+      {showSoftHint ? (
+        <div className="space-y-4">
+          <Callout tone="success" title="Entry added">
+            Spread turned on (Soft) — diversify only above the 65% floor.
+            Change it any time in the strategy card.
+          </Callout>
+          <Button onClick={handleSoftHintContinue} fullWidth>
+            Got it
+          </Button>
+        </div>
+      ) : (
+        <div className="space-y-4">
+          <Input
+            label="Entry label"
+            placeholder="Entry 2"
+            value={label}
+            onChange={(e) => setLabel(e.target.value)}
           />
-          <StrategyHelp mode={strategy} />
-        </div>
 
-        {error && <p className="text-sm text-danger">{error}</p>}
+          <div>
+            <label className="mb-1.5 block text-sm font-medium text-secondary">
+              Reserve strategy
+            </label>
+            <SegmentedControl
+              aria-label="Reserve strategy"
+              options={STRATEGY_OPTIONS}
+              value={strategy}
+              onValueChange={(v) => setStrategyLocal(v as LmsReserveStrategy)}
+              fullWidth
+            />
+            <StrategyHelp mode={strategy} />
+          </div>
 
-        <div className="flex gap-2">
-          <Button onClick={handleSubmit} disabled={saving} fullWidth>
-            {saving ? "Adding…" : "Add entry"}
-          </Button>
-          <Button
-            variant="ghost"
-            onClick={() => { reset(); onClose(); }}
-            disabled={saving}
-          >
-            Cancel
-          </Button>
+          {error && <p className="text-sm text-danger">{error}</p>}
+
+          <div className="flex gap-2">
+            <Button onClick={handleSubmit} disabled={saving} fullWidth>
+              {saving ? "Adding…" : "Add entry"}
+            </Button>
+            <Button
+              variant="ghost"
+              onClick={() => { reset(); onClose(); }}
+              disabled={saving}
+            >
+              Cancel
+            </Button>
+          </div>
         </div>
-      </div>
+      )}
     </BottomSheet>
   );
 }
