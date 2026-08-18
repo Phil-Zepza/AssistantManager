@@ -34,6 +34,20 @@ ELO_K = 20.0                 # Elo update step size
 ELO_HOME_ADV = 60.0          # home side gets +60 Elo when computing expectation
 ELO_DIV = 400.0             # standard Elo logistic divisor
 
+# --- Squad-value transfer modifier ---
+# The last-season seed (see seed_elo) has NO signal for summer transfer activity,
+# so a team that upgraded or gutted its squad over the window seeds identically to
+# how it finished last season. We nudge the seed by how a team's Squad Value Index
+# (SVI = sum of the now_cost of its 11 most expensive players) compares to what the
+# seed itself implies: shock = clamp((svi_z - elo_z) * SCALE, -CAP, +CAP). The
+# shock decays out linearly over the first DECAY_HORIZON completed matches as real
+# results accumulate, so by ~GW6 the model is back on pure form. These constants are
+# deliberately ROUGH, un-backtested starting points (same order of magnitude as
+# ELO_SEED_SPREAD = 25 pts/sigma) — easy to tune; feeds the workstream-5 backtest.
+TRANSFER_MODIFIER_SCALE = 15.0   # Elo points per 1.0 of (svi_z - elo_z)
+TRANSFER_MODIFIER_CAP = 20.0     # max magnitude of the transfer shock, +/- Elo pts
+DECAY_HORIZON = 6                # completed matches over which the shock fades to 0
+
 # --- Poisson / expected goals ---
 LEAGUE_AVG_GOALS = 1.40      # avg goals per team per game (PL ~2.8 total / 2)
 HOME_ADV_GOAL_MULT = 1.15    # home scoring boost / away suppression
@@ -96,6 +110,24 @@ def _f(x, default: float = 0.0) -> float:
 
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
+
+
+def _zscore(vals: dict[int, float]) -> dict[int, float]:
+    """Standardise a {key: value} map to z-scores across its own values.
+
+    z = (v - mean) / population_sd. Degrades gracefully: returns 0.0 for every
+    key when there are fewer than two values or the spread is flat (sd <= 0), so
+    a caller never divides by zero. Mirrors the inline standardisation in
+    `seed_elo`, exposed as a helper so the transfer modifier can reuse it.
+    """
+    n = len(vals)
+    if n < 2:
+        return {k: 0.0 for k in vals}
+    mean = sum(vals.values()) / n
+    sd = math.sqrt(sum((v - mean) ** 2 for v in vals.values()) / n)
+    if sd <= 0:
+        return {k: 0.0 for k in vals}
+    return {k: (v - mean) / sd for k, v in vals.items()}
 
 
 def _poisson_pmf(k: int, lam: float) -> float:
@@ -191,6 +223,63 @@ def seed_elo(teams: list[dict]) -> dict[int, float]:
             seeded = ELO_BASE + ELO_SEED_SPREAD * (v - mean) / sd
             elo[t["id"]] = _clamp(seeded, ELO_PROMOTED, ELO_STRONG)
     return elo
+
+
+def squad_value_index(elements: list[dict], top_n: int = 11) -> dict[int, float]:
+    """Squad Value Index per team = sum of `now_cost` for its `top_n` priciest players.
+
+    `elements` is the bootstrap-static players list (each has `now_cost` in tenths
+    of a million and `team` = FPL team id). Not position-weighted in v1 — a plain
+    top-11-by-price sum is a coarse but honest proxy for how much a club has spent
+    on its best XI, which shifts as summer business lands. Returns {team_id: svi}.
+
+    Caveat: the transfer window doesn't close until ~1 Sept (after GW1-2), so
+    `now_cost` (and therefore SVI) keeps moving as late deals complete. That's
+    expected — the pipeline runs daily and self-corrects on the next run; it is
+    not a bug and needs no special-casing here.
+    """
+    by_team: dict[int, list[float]] = {}
+    for e in elements:
+        tid = e.get("team")
+        if tid is None:
+            continue
+        by_team.setdefault(tid, []).append(_f(e.get("now_cost")))
+    return {
+        tid: sum(sorted(costs, reverse=True)[:top_n])
+        for tid, costs in by_team.items()
+    }
+
+
+def transfer_elo_shock(
+    svi_z: dict[int, float],
+    elo_z: dict[int, float],
+    scale: float = TRANSFER_MODIFIER_SCALE,
+    cap: float = TRANSFER_MODIFIER_CAP,
+) -> dict[int, float]:
+    """Per-team seed Elo shock from the squad-value vs seed mismatch.
+
+    shock = clamp((svi_z - elo_z) * scale, -cap, +cap). A team whose squad is worth
+    more than its last-season seed implies (svi_z > elo_z) gets a positive shock;
+    a gutted squad gets a negative one. Keyed on `svi_z`; a team missing from
+    `elo_z` is treated as z=0 (league average).
+    """
+    return {
+        tid: _clamp((z - elo_z.get(tid, 0.0)) * scale, -cap, cap)
+        for tid, z in svi_z.items()
+    }
+
+
+def transfer_decay_weight(completed_matches: float, horizon: float = DECAY_HORIZON) -> float:
+    """Linear decay of the transfer shock as real results accumulate.
+
+    weight = max(0, 1 - completed_matches / horizon). `completed_matches` MUST be
+    the team's CUMULATIVE season-to-date finished count (not a single run's batch)
+    so the shock fades to 0 by `horizon` matches (~GW6) and the model reverts to
+    pure form.
+    """
+    if horizon <= 0:
+        return 0.0
+    return max(0.0, 1.0 - completed_matches / horizon)
 
 
 def update_elo(elo: dict[int, float], finished_fixtures: list[dict]) -> dict[int, float]:
@@ -515,6 +604,32 @@ if __name__ == "__main__":
     flat = [{"id": i, "strength_overall_home": 0, "strength_overall_away": 0} for i in (1, 2, 3)]
     felo = seed_elo(flat)
     assert set(felo.values()) == {ELO_BASE}, f"flat league should seed to base: {felo}"
+
+    # --- squad-value transfer modifier ---
+    # Two teams seed identically, but team 2 has spent far more on its XI. Its
+    # SVI z-score should exceed its seed z-score -> a POSITIVE transfer shock; the
+    # under-spending team 1 gets a symmetric negative one.
+    svi_elements = (
+        [{"id": 1000 + i, "team": 1, "now_cost": 45} for i in range(11)]      # cheap XI
+        + [{"id": 2000 + i, "team": 2, "now_cost": 95} for i in range(11)]    # pricey XI
+        + [{"id": 1900, "team": 1, "now_cost": 40}]  # cheap 12th man dropped (top-11 only)
+    )
+    svi = squad_value_index(svi_elements)
+    assert svi[2] > svi[1], f"pricier squad should have higher SVI: {svi}"
+    assert svi[1] == 45 * 11, f"top-11-only: cheap 12th man must be excluded: {svi[1]}"
+    flat_seed = {1: ELO_BASE, 2: ELO_BASE}  # identical last-season seed
+    shock = transfer_elo_shock(_zscore(svi), _zscore(flat_seed))
+    assert shock[2] > 0 > shock[1], f"spend gap should shock 2 up, 1 down: {shock}"
+    assert abs(shock[1]) <= TRANSFER_MODIFIER_CAP and abs(shock[2]) <= TRANSFER_MODIFIER_CAP, \
+        f"shock must respect the cap: {shock}"
+    # a huge z-gap must saturate at exactly the cap, not blow past it
+    saturated = transfer_elo_shock({9: 5.0}, {9: -5.0})
+    assert saturated[9] == TRANSFER_MODIFIER_CAP, f"shock should clamp to cap: {saturated}"
+    # decay: full weight preseason, zero once the horizon of matches is played
+    assert transfer_decay_weight(0) == 1.0, "no games played -> full shock"
+    assert transfer_decay_weight(DECAY_HORIZON) == 0.0, "horizon reached -> shock gone"
+    assert transfer_decay_weight(DECAY_HORIZON + 5) == 0.0, "never negative"
+    assert 0.0 < transfer_decay_weight(DECAY_HORIZON / 2) < 1.0, "mid-decay in (0,1)"
 
     finished = [
         {"fpl_id": 10, "kickoff": "2025-08-16T14:00:00Z",

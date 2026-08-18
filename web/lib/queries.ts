@@ -674,6 +674,9 @@ export async function getGameweekFixtures(
     pHome: r.probs?.p_home ?? null,
     pDraw: r.probs?.p_draw ?? null,
     pAway: r.probs?.p_away ?? null,
+    marketPHome: r.probs?.market_p_home ?? null,
+    marketPAway: r.probs?.market_p_away ?? null,
+    marketDivergence: r.probs?.market_divergence ?? null,
   }));
 }
 

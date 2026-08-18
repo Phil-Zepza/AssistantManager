@@ -960,6 +960,18 @@ function FixtureRow({
   // Backable side of this fixture (favoured available team; null if none).
   const pick = pickFromFixture(f, usedTeamIds);
 
+  // Market-divergence flag (QA calibration): when our model and the bookmakers
+  // disagree by > 15pp on the favoured win side, surface both numbers so it can
+  // be sanity-checked by eye. Favoured side = whichever of home/away we rate higher.
+  const favHome = (f.pHome ?? 0) >= (f.pAway ?? 0);
+  const favModelP = favHome ? f.pHome : f.pAway;
+  const favMarketP = favHome ? f.marketPHome : f.marketPAway;
+  const showDivergence =
+    f.marketDivergence != null &&
+    f.marketDivergence > 0.15 &&
+    favModelP != null &&
+    favMarketP != null;
+
   return (
     <Card padding="sm">
       <div className="flex items-center gap-2">
@@ -1038,6 +1050,14 @@ function FixtureRow({
           </Button>
         )}
       </div>
+
+      {showDivergence && (
+        <div className="mt-2 flex justify-center">
+          <Badge tone="warning">
+            {`Model ${formatPct(favModelP)} · Market ${formatPct(favMarketP)} — worth a look`}
+          </Badge>
+        </div>
+      )}
 
       {expanded && (
         <div className="mt-3 grid grid-cols-1 gap-3 border-t border-subtle pt-3 sm:grid-cols-2">
