@@ -68,13 +68,13 @@ export default function LoginPage() {
 
       <div className="relative w-full max-w-sm">
         <div className="mb-8 text-center">
-          <div className="mx-auto mb-4 grid h-14 w-14 place-items-center rounded-2xl bg-accent text-xl font-black text-on-accent shadow-card">
-            P
-          </div>
-          <h1 className="text-2xl font-extrabold tracking-tight text-primary">
-            PUSB <span className="text-muted">·</span>{" "}
-            <span className="text-accent">FPL + LMS</span>
-          </h1>
+          <h1 className="sr-only">AI Gaffer</h1>
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src="/logo/lockup.svg"
+            alt="AI Gaffer"
+            className="mx-auto mb-4 h-28 w-auto"
+          />
           <p className="mx-auto mt-2 max-w-xs text-sm text-secondary">
             Your Fantasy Premier League &amp; Last Man Standing edge — captain
             picks, transfers and survival, in one place.

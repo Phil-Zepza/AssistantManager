@@ -21,12 +21,10 @@ export default async function OnboardingPage() {
     <div className="relative flex min-h-[100dvh] flex-col">
       {/* Wordmark-only top bar */}
       <header className="flex h-14 items-center gap-2 px-5">
-        <span className="grid h-8 w-8 place-items-center rounded-lg bg-accent text-sm font-black text-on-accent">
-          P
-        </span>
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img src="/logo/mark.svg" alt="" className="h-8 w-auto" />
         <span className="text-sm font-extrabold tracking-tight text-primary">
-          PUSB <span className="text-muted">·</span>{" "}
-          <span className="text-accent">FPL + LMS</span>
+          AI Gaffer
         </span>
       </header>
 

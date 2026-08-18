@@ -22,9 +22,9 @@ export function currentSeasonLabel(now: Date = new Date()): string {
   return seasonLabelFor(now);
 }
 
-// The league/team tag shown on the profile header (e.g. "PUSB26"): the app
-// wordmark + the 2-digit season start year. Kept in one place so it stays in
-// step with the AppShell wordmark ("PUSB").
+// The FPL mini-league tag shown on the profile header (e.g. "PUSB26"): the
+// league code + the 2-digit season start year. This is the real mini-league
+// name ("PUSB"), independent of the app's own brand (now "AI Gaffer").
 export const LEAGUE_WORDMARK = "PUSB";
 
 export function teamTag(now: Date = new Date()): string {
