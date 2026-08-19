@@ -534,6 +534,8 @@ export interface ComputeCompetitionPlanInput {
 export interface SpreadPlannedPick extends PlannedPick {
   entryId: number;
   spreadSource: SpreadSource;
+  /** True when the pick was pinned manually by the user and bypassed joint spread allocation. */
+  manualOverride?: boolean;
 }
 
 export interface CompetitionEntryPlan {
@@ -699,13 +701,19 @@ export function computeCompetitionPlan(
       .push({ gw, teamId, pWin, reason, flags, entryId, spreadSource });
   };
 
-  // Collapse a round: every alive entry backs one team (tagged matched). `preferred`
-  // is the intended team (Soft's single floor-clearer); otherwise pick the safest
-  // team available to EVERY alive entry. An entry that cannot use the common team
-  // (already used it) falls back to its own safest, still tagged matched.
-  const collapseRound = (gw: number, preferred?: number): void => {
+  // Collapse a round: every entry in `entrySubset` backs one team (tagged matched).
+  // `preferred` is the intended team (Soft's single floor-clearer); otherwise pick
+  // the safest team available to every entry in the subset. `preAssigned` contains
+  // teams already taken by pinned entries this round — excluded from the common pool.
+  const collapseRound = (
+    gw: number,
+    preferred?: number,
+    entrySubset: typeof entries = entries,
+    preAssigned: ReadonlySet<number> = new Set(),
+  ): void => {
     const availableToAll = (id: number): boolean =>
-      entries.every(
+      !preAssigned.has(id) &&
+      entrySubset.every(
         (e) =>
           !allocatedByEntry.get(e.entryId)!.has(id) &&
           !reservedByEntry.get(e.entryId)!.has(id),
@@ -725,7 +733,7 @@ export function computeCompetitionPlan(
         }
       }
     }
-    for (const e of entries) {
+    for (const e of entrySubset) {
       if (
         chosen != null &&
         !allocatedByEntry.get(e.entryId)!.has(chosen) &&
@@ -747,9 +755,17 @@ export function computeCompetitionPlan(
 
   // Greedy distinct allocation for one round. `useFloor` gates Soft to floor-clearing
   // candidates; Strong hands out the next-best distinct candidate however low.
-  const allocateDistinct = (gw: number, useFloor: boolean): void => {
-    const assigned = new Set<number>();
-    for (const e of entries) {
+  // `entrySubset` restricts allocation to a subset of entries (used when some entries
+  // have been handled via manual pins). `preAssigned` seeds the round's "taken" set so
+  // pinned teams are not re-allocated to coordinated entries.
+  const allocateDistinct = (
+    gw: number,
+    useFloor: boolean,
+    entrySubset: typeof entries = entries,
+    preAssigned: ReadonlySet<number> = new Set(),
+  ): void => {
+    const assigned = new Set<number>(preAssigned);
+    for (const e of entrySubset) {
       const floor = floorByEntry.get(e.entryId)!;
       const cands = candidatesFor(e.entryId, gw);
       const solo = cands[0]; // the entry's own pure-safest this round
@@ -829,27 +845,55 @@ export function computeCompetitionPlan(
       continue;
     }
 
+    // For soft/strong: honor per-entry manual pins before coordinated allocation.
+    // A pinned entry is excluded from the joint pool; its team is pre-assigned so
+    // coordinated entries won't duplicate it. This is client-side only — no
+    // premature persistence; submitPick locks the round when the user confirms.
+    const handledEntries = new Set<number>();
+    const preAssigned = new Set<number>();
+    for (const e of entries) {
+      const base = basePickAt(e.entryId, gw);
+      if (base != null && base.flags.includes("pinned") && base.teamId != null) {
+        allocatedByEntry.get(e.entryId)!.add(base.teamId);
+        picksByEntry.get(e.entryId)!.push({
+          gw,
+          teamId: base.teamId,
+          pWin: base.pWin,
+          reason: base.reason,
+          flags: base.flags,
+          entryId: e.entryId,
+          spreadSource: null,
+          manualOverride: true,
+        });
+        handledEntries.add(e.entryId);
+        preAssigned.add(base.teamId);
+      }
+    }
+
+    const unhandledEntries = entries.filter((e) => !handledEntries.has(e.entryId));
+    if (unhandledEntries.length === 0) continue;
+
     if (spreadMode === "soft") {
-      // Union of teams that clear each entry's floor and are available to it.
+      // Union of teams that clear each entry's floor, excluding already-pinned teams.
       const floorTeams = new Set<number>();
-      for (const e of entries) {
+      for (const e of unhandledEntries) {
         const floor = floorByEntry.get(e.entryId)!;
         for (const c of candidatesFor(e.entryId, gw)) {
-          if (c.win.pWin >= floor) floorTeams.add(c.teamId);
+          if (c.win.pWin >= floor && !preAssigned.has(c.teamId)) floorTeams.add(c.teamId);
         }
       }
       if (floorTeams.size === 1) {
-        // Only one team clears the floor for the whole set — auto-collapse.
-        collapseRound(gw, [...floorTeams][0]);
+        // Only one team clears the floor for the unhandled entries — auto-collapse them.
+        collapseRound(gw, [...floorTeams][0], unhandledEntries, preAssigned);
         autoCollapsedGws.push(gw);
         continue;
       }
-      allocateDistinct(gw, true);
+      allocateDistinct(gw, true, unhandledEntries, preAssigned);
       continue;
     }
 
     // strong
-    allocateDistinct(gw, false);
+    allocateDistinct(gw, false, unhandledEntries, preAssigned);
   }
 
   return {
