@@ -51,14 +51,21 @@ export interface ModelPlayerEp {
 
 export interface ModelFixtureProbs {
   fixture_id: number;
+  // Shown distribution: = market when the fixture is priced, = model otherwise
+  // (market-when-priced hard switch). Every reader/planner uses p_*. See 006.
   p_home: number | null;
   p_draw: number | null;
   p_away: number | null;
+  // The model's own canonical distribution (always the model, never the market).
+  model_p_home: number | null;
+  model_p_draw: number | null;
+  model_p_away: number | null;
   exp_goals_h: number | null;
   exp_goals_a: number | null;
   computed_at: string;
-  // Bookmaker market probabilities (QA calibration only — not a model input).
-  // Populated by the pipeline's odds step; null when unavailable. See 004 migration.
+  // De-vigged bookmaker market. `market_available` is true once the odds step
+  // matched a book for this fixture; null/false means the shown p_* is the model.
+  market_available: boolean | null;
   market_p_home: number | null;
   market_p_draw: number | null;
   market_p_away: number | null;
@@ -418,11 +425,17 @@ export interface LmsGameweekFixture {
   awayTeam: Team | null;
   kickoff: string | null;
   finished: boolean;
+  // Shown distribution: = market when priced, = model otherwise (hard switch).
   pHome: number | null;
   pDraw: number | null;
   pAway: number | null;
-  // Bookmaker market probabilities + divergence (QA calibration; null when
-  // unavailable). Surfaced as a "worth a look" badge when divergence is large.
+  // The model's own view, kept alongside so the divergence badge can compare
+  // model vs market even after p_* has switched to the market.
+  modelPHome: number | null;
+  modelPAway: number | null;
+  // De-vigged bookmaker market + divergence. `marketAvailable` false => the
+  // fixture is unpriced (usually a future round) and p_* is the model estimate.
+  marketAvailable: boolean | null;
   marketPHome: number | null;
   marketPAway: number | null;
   marketDivergence: number | null;

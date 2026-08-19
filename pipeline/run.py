@@ -15,6 +15,7 @@ Requires env: DATABASE_URL (Railway Postgres connection string)
 """
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import traceback
@@ -26,6 +27,8 @@ import fpl_api
 import models
 import odds_api
 from db import connect, query, replace_recommendation, upsert
+
+logger = logging.getLogger("pipeline")
 
 
 # ------------------------------ small helpers ------------------------------
@@ -167,13 +170,18 @@ def step1_reference_data(conn, bootstrap, fixtures):
     return fixture_rows
 
 
-def step2_elo_and_fixture_probs(conn, bootstrap, fixture_rows, svi_gw):
+def step2_elo_and_fixture_probs(conn, bootstrap, fixture_rows):
     """Return (strengths, exp_goals_by_fixture) for reuse in step 3.
 
-    `svi_gw` is the gameweek the transfer-modifier snapshot is stored against
-    (the upcoming round the adjusted rating feeds); persisted per (team, gw) so
-    a re-run overwrites it idempotently.
+    Seeds each team's Elo straight from last season's strength proxy (see
+    models.seed_elo) — no squad-value transfer modifier — then applies match
+    updates from finished fixtures. Writes the MODEL distribution to both the
+    canonical model_p_* columns and the SHOWN p_* columns; the odds step
+    (step_odds_calibration) overwrites p_* with the market distribution for any
+    fixture the book has priced. `market_available` is defaulted false here so a
+    fixture the market no longer prices reverts to the model on the next run.
     """
+    now = datetime.now(timezone.utc)
     seed = models.seed_elo(bootstrap["teams"])
 
     finished = [
@@ -182,48 +190,7 @@ def step2_elo_and_fixture_probs(conn, bootstrap, fixture_rows, svi_gw):
         if fx["finished"] and fx["home_score"] is not None and fx["away_score"] is not None
     ]
 
-    # --- squad-value transfer modifier -------------------------------------
-    # Nudge each team's SEED Elo by how its current squad value compares to what
-    # last season's seed implies, before running match updates. The shock decays
-    # out over DECAY_HORIZON *cumulative* completed matches this season, so it
-    # fades to zero by ~GW6 and the model reverts to pure form.
-    now = datetime.now(timezone.utc)
-    svi = models.squad_value_index(bootstrap["elements"])
-    svi_z = models._zscore(svi)
-    elo_z = models._zscore(seed)  # z of the PRE-modifier seed, per spec
-    shock = models.transfer_elo_shock(svi_z, elo_z)
-
-    # completed matches per team = CUMULATIVE season-to-date. `finished` is
-    # filtered from the full-season fixtures list (fpl_api.get_fixtures), NOT a
-    # per-run delta, so counting each team's appearances gives its running total.
-    completed: dict[int, int] = defaultdict(int)
-    for fx in finished:
-        for tid in (fx["home_team"], fx["away_team"]):
-            if tid is not None:
-                completed[tid] += 1
-
-    effective_seed: dict[int, float] = {}
-    svi_rows = []
-    for tid, base in seed.items():
-        weight = models.transfer_decay_weight(completed.get(tid, 0))
-        sh = shock.get(tid, 0.0)
-        effective_seed[tid] = base + sh * weight
-        if tid in svi:  # only teams with a computed SVI get a persisted row
-            svi_rows.append(
-                {
-                    "team_id": tid,
-                    "gw": svi_gw,
-                    "svi": round(svi[tid], 1),
-                    "svi_z": round(svi_z.get(tid, 0.0), 4),
-                    "transfer_elo_shock": round(sh, 3),
-                    "decay_weight": round(weight, 4),
-                    "computed_at": now,
-                }
-            )
-    if svi_gw is not None and svi_rows:
-        upsert(conn, "team_squad_value_index", svi_rows, "team_id,gw")
-
-    elo = models.update_elo(effective_seed, finished)
+    elo = models.update_elo(seed, finished)
     strengths = models.team_strengths_from_elo(elo)
 
     # persist Elo + derived attack/defence ratings back onto teams.
@@ -258,12 +225,21 @@ def step2_elo_and_fixture_probs(conn, bootstrap, fixture_rows, svi_gw):
         if fx["home_team"] is None or fx["away_team"] is None:
             continue
         row = models.fixture_prob_row(fx, strengths)
+        ph, pd, pa = round(row["p_home"], 4), round(row["p_draw"], 4), round(row["p_away"], 4)
         prob_rows.append(
             {
                 "fixture_id": row["fixture_id"],
-                "p_home": round(row["p_home"], 4),
-                "p_draw": round(row["p_draw"], 4),
-                "p_away": round(row["p_away"], 4),
+                # model distribution: canonical, always the model's own view.
+                "model_p_home": ph,
+                "model_p_draw": pd,
+                "model_p_away": pa,
+                # shown distribution: defaults to the model; the odds step
+                # overwrites these with the market for any priced fixture.
+                "p_home": ph,
+                "p_draw": pd,
+                "p_away": pa,
+                # reset each run: true only once the odds step matches a book.
+                "market_available": False,
                 "exp_goals_h": round(row["exp_goals_h"], 3),
                 "exp_goals_a": round(row["exp_goals_a"], 3),
                 "computed_at": now,
@@ -273,45 +249,79 @@ def step2_elo_and_fixture_probs(conn, bootstrap, fixture_rows, svi_gw):
 
     upsert(conn, "model_fixture_probs", prob_rows, "fixture_id")
     print(
-        f"[step 2] elo updated from {len(finished)} finished fixtures "
-        f"(transfer modifier applied to {len(svi_rows)} teams, gw {svi_gw}); "
-        f"wrote {len(prob_rows)} fixture probabilities"
+        f"[step 2] elo updated from {len(finished)} finished fixtures; "
+        f"wrote {len(prob_rows)} fixture probabilities (model; market applied in odds step)"
     )
     return strengths, exp_goals_by_fixture
 
 
+def record_pipeline_health(conn, step: str, status: str, detail: Optional[str] = None) -> None:
+    """Append a visible health marker for `step` and commit it immediately.
+
+    Append-only log so an outage leaves a durable, queryable trace even if a
+    later step crashes and rolls back the rest of the run. Best-effort: a failure
+    to write the marker (e.g. the table missing before its migration) is logged
+    but never raised — health logging must not itself break the pipeline.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO pipeline_health (step, status, detail) VALUES (%s, %s, %s)",
+                (step, status, detail),
+            )
+        conn.commit()
+    except Exception as exc:  # noqa: BLE001 — health logging is best-effort
+        logger.error("failed to record pipeline_health(%s, %s): %s", step, status, exc)
+
+
 def step_odds_calibration(conn) -> None:
-    """QA-only: compare our model fixture probs against de-vigged bookmaker odds.
+    """Hard switch: use the de-vigged MARKET distribution as the shown p_* for any
+    fixture the book has priced; fixtures the market hasn't priced keep the model.
 
-    Independent sanity signal, NOT an input to the probability model (which stays
-    self-contained by design). Fetches h2h odds once from The Odds API, matches
-    each event to our upcoming fixtures, takes the MEDIAN odds across bookmakers,
-    de-vigs to implied probabilities, and stores them plus `market_divergence` on
-    model_fixture_probs so the web layer can flag big gaps.
+    Fetches h2h odds once from The Odds API, matches each event to our upcoming
+    fixtures, takes the MEDIAN odds across bookmakers, de-vigs to implied
+    probabilities, and for each matched fixture:
+      * overwrites the shown p_home/p_draw/p_away with the (renormalised) market
+        distribution and sets market_available = true,
+      * persists market_p_* / market_odds_source / market_fetched_at, and
+      * records market_divergence = |model_p - market_p| on the model's FAVOURED
+        WIN SIDE (max of model_p_home/model_p_away), the team we most back to win.
+    Fixtures with no market row keep market_available = false (set in step 2) and
+    therefore keep showing the model — most such fixtures are simply future rounds.
 
-    Divergence is measured on the model's FAVOURED WIN SIDE — max(p_home, p_away),
-    the team we most back to win — vs the market's probability for that same side
-    (draw excluded), matching the LMS "back a team to win" framing.
-
-    Fails SOFT: a missing ODDS_API_KEY or any fetch error logs a warning and
-    returns without touching the run — this is an add-on, never a blocker.
+    FAILS LOUD, not soft. A missing ODDS_API_KEY, a failed fetch, or an empty feed
+    logs at ERROR and records a `pipeline_health` marker so the outage is
+    impossible to miss. The run still completes and every fixture falls back to the
+    model, but the health signal makes the degraded state visible.
     """
     api_key = os.environ.get("ODDS_API_KEY")
     if not api_key:
-        print("[odds] ODDS_API_KEY not set; skipping market calibration (QA add-on)")
+        logger.error(
+            "ODDS_API_KEY is not set — market prices unavailable; "
+            "ALL fixtures fall back to the model estimate this run"
+        )
+        record_pipeline_health(conn, "odds", "error", "ODDS_API_KEY not set")
         return
 
     try:
         events = odds_api.get_h2h_odds(api_key)
-    except Exception as exc:  # noqa: BLE001 — never let a QA add-on fail the run
-        print(f"[odds] fetch failed ({exc}); skipping market calibration")
+    except Exception as exc:  # noqa: BLE001 — surface loudly, but let the run finish on model
+        logger.error("odds fetch failed (%s) — ALL fixtures fall back to the model estimate", exc)
+        record_pipeline_health(conn, "odds", "error", f"fetch failed: {exc}")
         return
 
-    # our upcoming fixtures with model probs, keyed by (home_id, away_id)
+    if not events:
+        logger.error("odds fetch returned no events — ALL fixtures fall back to the model estimate")
+        record_pipeline_health(conn, "odds", "error", "empty odds feed")
+        return
+
+    # our upcoming fixtures with the MODEL distribution, keyed by (home_id, away_id).
+    # Divergence is measured against model_p_* (the canonical model view), not the
+    # shown p_* which this step is about to overwrite with the market.
     fx_rows = query(
         conn,
         "SELECT f.fpl_id, f.home_team, f.away_team, f.kickoff, "
-        "       mp.p_home, mp.p_away "
+        "       mp.model_p_home, mp.model_p_away "
         "  FROM fixtures f "
         "  JOIN model_fixture_probs mp ON mp.fixture_id = f.fpl_id "
         " WHERE f.finished = false AND f.gw IS NOT NULL",
@@ -324,7 +334,7 @@ def step_odds_calibration(conn) -> None:
     now = datetime.now(timezone.utc)
     rows = []
     matched = unmatched = flagged = 0
-    for ev in events or []:
+    for ev in events:
         home_id = odds_api.match_team_id(ev.get("home_team"), lookup)
         away_id = odds_api.match_team_id(ev.get("away_team"), lookup)
         fx = fx_by_teams.get((home_id, away_id))
@@ -342,20 +352,33 @@ def step_odds_calibration(conn) -> None:
             continue
         mkt_home, mkt_draw, mkt_away = devig
 
-        p_home, p_away = fx["p_home"], fx["p_away"]
+        # defensive renormalise: implied_devig already sums to 1, but guard anyway
+        # so the shown distribution can never drift off 1.0.
+        tot = mkt_home + mkt_draw + mkt_away
+        if tot <= 0:
+            unmatched += 1
+            continue
+        mkt_home, mkt_draw, mkt_away = mkt_home / tot, mkt_draw / tot, mkt_away / tot
+
+        # divergence on the model's favoured win side (model_p_home vs model_p_away)
+        m_home, m_away = fx["model_p_home"], fx["model_p_away"]
         divergence = None
-        if p_home is not None and p_away is not None:
-            # favoured win side: whichever of home/away our model rates higher
-            if p_home >= p_away:
-                divergence = abs(p_home - mkt_home)
+        if m_home is not None and m_away is not None:
+            if m_home >= m_away:
+                divergence = abs(m_home - mkt_home)
             else:
-                divergence = abs(p_away - mkt_away)
+                divergence = abs(m_away - mkt_away)
             if divergence > 0.15:
                 flagged += 1
 
         rows.append(
             {
                 "fixture_id": fx["fpl_id"],
+                # HARD SWITCH: shown probs become the market for this priced fixture.
+                "p_home": round(mkt_home, 4),
+                "p_draw": round(mkt_draw, 4),
+                "p_away": round(mkt_away, 4),
+                "market_available": True,
                 "market_p_home": round(mkt_home, 4),
                 "market_p_draw": round(mkt_draw, 4),
                 "market_p_away": round(mkt_away, 4),
@@ -366,12 +389,17 @@ def step_odds_calibration(conn) -> None:
         )
         matched += 1
 
-    # partial-column upsert: only the market_* columns are in each row, so ON
-    # CONFLICT (fixture_id) DO UPDATE leaves p_home/exp_goals_*/computed_at intact.
+    # Partial-column upsert: each row carries p_* + market_* + market_available, so
+    # ON CONFLICT (fixture_id) DO UPDATE overwrites the shown probs with the market
+    # for matched fixtures while leaving model_p_*/exp_goals_*/computed_at intact.
     upsert(conn, "model_fixture_probs", rows, "fixture_id")
+    record_pipeline_health(
+        conn, "odds", "ok",
+        f"{matched} matched, {unmatched} unmatched, {flagged} divergent",
+    )
     print(
-        f"[odds] market calibration: {matched} fixtures matched, "
-        f"{unmatched} unmatched, {flagged} flagged (divergence > 0.15)"
+        f"[odds] market applied to {matched} fixtures (shown p_* = market), "
+        f"{unmatched} unmatched (model fallback), {flagged} flagged (divergence > 0.15)"
     )
 
 
@@ -735,6 +763,11 @@ def step5_lms_resolve(conn) -> None:
 
 # ------------------------------ main ------------------------------
 def main() -> int:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
     print("Fetching FPL API ...")
     bootstrap = fpl_api.get_bootstrap_static()
     fixtures = fpl_api.get_fixtures()
@@ -746,12 +779,12 @@ def main() -> int:
 
     with connect() as conn:
         fixture_rows = step1_reference_data(conn, bootstrap, fixtures)
-        # store the transfer-modifier snapshot against the upcoming round it feeds
-        svi_gw = next_gw if next_gw is not None else current_gw
         _, exp_goals_by_fixture = step2_elo_and_fixture_probs(
-            conn, bootstrap, fixture_rows, svi_gw
+            conn, bootstrap, fixture_rows
         )
-        step_odds_calibration(conn)  # QA add-on; fails soft, must run after step 2
+        # market hard switch: overwrites shown p_* with market for priced fixtures.
+        # Fails LOUD (ERROR log + pipeline_health marker); must run after step 2.
+        step_odds_calibration(conn)
         step3_player_ep(conn, bootstrap, fixture_rows, exp_goals_by_fixture, next_gw)
         step_player_season_stats(conn, bootstrap, current_season)
         step4_users(conn, current_gw, next_gw)
