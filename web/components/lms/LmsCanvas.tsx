@@ -1042,17 +1042,22 @@ function FixtureRow({
   // Backable side of this fixture (favoured available team; null if none).
   const pick = pickFromFixture(f, usedTeamIds);
 
-  // Market-divergence flag (QA calibration): when our model and the bookmakers
-  // disagree by > 15pp on the favoured win side, surface both numbers so it can
-  // be sanity-checked by eye. Favoured side = whichever of home/away we rate higher.
-  const favHome = (f.pHome ?? 0) >= (f.pAway ?? 0);
-  const favModelP = favHome ? f.pHome : f.pAway;
+  // Market-divergence flag: when our OWN model and the bookmakers disagree by
+  // > 15pp on the favoured win side, surface both numbers so it can be sanity-
+  // checked by eye. Favoured side = whichever of home/away our model rates higher.
+  // (Compares model_p_* vs market_p_*, i.e. before the shown blend — see 006.)
+  const favHome = (f.modelPHome ?? 0) >= (f.modelPAway ?? 0);
+  const favModelP = favHome ? f.modelPHome : f.modelPAway;
   const favMarketP = favHome ? f.marketPHome : f.marketPAway;
   const showDivergence =
     f.marketDivergence != null &&
     f.marketDivergence > 0.15 &&
     favModelP != null &&
     favMarketP != null;
+
+  // No bookmaker line for this fixture -> the shown p_* is our raw model estimate
+  // (poorly calibrated early season). Flag it so the number is read with caution.
+  const marketUnavailable = f.marketAvailable === false;
 
   return (
     <Card padding="sm">
@@ -1138,6 +1143,12 @@ function FixtureRow({
           <Badge tone="warning">
             {`Model ${formatPct(favModelP)} · Market ${formatPct(favMarketP)} — worth a look`}
           </Badge>
+        </div>
+      )}
+
+      {marketUnavailable && (
+        <div className="mt-2 flex justify-center">
+          <Badge tone="gray">Market unavailable — model estimate</Badge>
         </div>
       )}
 

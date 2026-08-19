@@ -51,14 +51,23 @@ export interface ModelPlayerEp {
 
 export interface ModelFixtureProbs {
   fixture_id: number;
+  // Shown distribution: a decaying blend of market + own model (see 006 migration).
   p_home: number | null;
   p_draw: number | null;
   p_away: number | null;
   exp_goals_h: number | null;
   exp_goals_a: number | null;
   computed_at: string;
-  // Bookmaker market probabilities (QA calibration only — not a model input).
-  // Populated by the pipeline's odds step; null when unavailable. See 004 migration.
+  // Our own Elo+Poisson distribution (what p_* held pre-006). See 006 migration.
+  model_p_home: number | null;
+  model_p_draw: number | null;
+  model_p_away: number | null;
+  // Market-anchored blend bookkeeping. market_available=false -> p_* is the
+  // pure-model fallback (surfaced as a "Market unavailable" flag). See 006 migration.
+  market_weight: number | null;
+  market_available: boolean | null;
+  // De-vigged bookmaker market. market_divergence is model_p_* vs market_p_* on
+  // the favoured win side. Null when no line was available. See 004 / 006 migrations.
   market_p_home: number | null;
   market_p_draw: number | null;
   market_p_away: number | null;
@@ -418,11 +427,17 @@ export interface LmsGameweekFixture {
   awayTeam: Team | null;
   kickoff: string | null;
   finished: boolean;
+  // Shown distribution: the market-anchored blend (see 006 migration).
   pHome: number | null;
   pDraw: number | null;
   pAway: number | null;
-  // Bookmaker market probabilities + divergence (QA calibration; null when
-  // unavailable). Surfaced as a "worth a look" badge when divergence is large.
+  // Our own model's distribution (pre-blend) — drives the "model vs market" badge.
+  modelPHome: number | null;
+  modelPAway: number | null;
+  // Bookmaker market probabilities + divergence (model vs market on the favoured
+  // win side). marketAvailable=false -> pHome/etc are the pure-model fallback,
+  // surfaced as a "Market unavailable — model estimate" flag.
+  marketAvailable: boolean | null;
   marketPHome: number | null;
   marketPAway: number | null;
   marketDivergence: number | null;

@@ -132,17 +132,36 @@ create table if not exists model_player_ep (
 
 create table if not exists model_fixture_probs (
   fixture_id  int references fixtures(fpl_id) primary key,
+  -- p_* is the SHOWN distribution: a decaying blend of market + own model. See 006.
   p_home real, p_draw real, p_away real,
   exp_goals_h real, exp_goals_a real,
   computed_at timestamptz default now(),
-  -- bookmaker odds calibration (QA only, NOT a model input) — see 004 migration.
-  -- Median across UK books, de-vigged; divergence on the model's favoured win side.
+  -- our own Elo+Poisson distribution (what p_* held pre-006) — see 006 migration.
+  model_p_home numeric,
+  model_p_draw numeric,
+  model_p_away numeric,
+  -- market-anchored blend bookkeeping — see 006 migration.
+  market_weight    numeric,   -- w_market actually used for the shown blend
+  market_available boolean,   -- false -> p_* is the pure-model fallback (web flags it)
+  -- de-vigged bookmaker market (median across UK books) — see 004 migration.
+  -- market_divergence is model_p_* vs market_p_* on the favoured win side (see 006).
   market_p_home      real,
   market_p_draw      real,
   market_p_away      real,
   market_divergence  real,
   market_odds_source text,
   market_fetched_at  timestamptz
+);
+
+-- One current-status row per pipeline step — see 006 migration. Lets an odds
+-- outage (which degrades the shown win prob to the raw, poorly-calibrated model)
+-- be surfaced instead of silently shipped. pipeline/run.py step_market_blend
+-- writes status='error' on a missing key or failed/empty fetch, 'ok' otherwise.
+create table if not exists pipeline_health (
+  step        text primary key,
+  status      text not null,
+  detail      text,
+  updated_at  timestamptz not null default now()
 );
 
 -- Per-team Squad Value Index + transfer-modifier components — see 003 migration.
