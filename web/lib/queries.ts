@@ -44,6 +44,47 @@ import {
 
 const POSITIONS: Position[] = ["GK", "DEF", "MID", "FWD"];
 
+// ---------- migration-lag tolerance ----------
+//
+// The web app can deploy (Vercel) ahead of the database getting its migrations
+// applied (Railway pipeline) — see db/README.md. A read that references a column
+// or table from a not-yet-applied migration then throws 42703 (undefined_column)
+// or 42P01 (undefined_table), which — unguarded — 500s the whole route even
+// though every OTHER query on the page is fine. That is exactly what blanked the
+// LMS competition detail page: db/migrations/005_lms_spread_engine.sql adds
+// lms_competitions.spread_mode / spread_floor_soft, lms_entry_picks.spread_source
+// and the lms_competition_spread_overrides table, and the detail route reads all
+// three. Rather than depend on the DB never lagging, we degrade those specific
+// reads to their pre-005 shape (spread off, no overrides, null provenance) when —
+// and only when — the schema is genuinely absent, mirroring the getTeamScouting
+// guard for player_season_stats. A real query fault still surfaces.
+function isMissingSchemaError(err: unknown): boolean {
+  const code = (err as { code?: string } | null)?.code;
+  return code === "42703" || code === "42P01";
+}
+
+// Run `primary`; if it fails ONLY because a migration has not been applied to this
+// database yet, fall back to `fallback` (the pre-migration query). Any other error
+// is a genuine fault and rethrows unchanged.
+async function tolerateMissingSchema<T>(
+  label: string,
+  primary: () => Promise<T>,
+  fallback: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await primary();
+  } catch (err) {
+    if (isMissingSchemaError(err)) {
+      console.warn(
+        `[lms] ${label}: spread schema unavailable — degrading to pre-migration defaults:`,
+        (err as { code?: string }).code,
+      );
+      return await fallback();
+    }
+    throw err;
+  }
+}
+
 // ---------- current user profile ----------
 
 // Load the app profile row for the signed-in user. `userId` ALWAYS comes from
@@ -524,18 +565,31 @@ export async function getCompetition(
   id: number,
   userId: number,
 ): Promise<LmsCompetitionDetail | null> {
-  const compRows = await q<{
+  type CompRow = {
     id: number;
     user_id: number;
     name: string;
     start_gw: number;
     notes: string | null;
-    spread_mode: LmsSpreadMode;
-    spread_floor_soft: string; // numeric — coerce with Number()
-  }>(
-    `select id, user_id, name, start_gw, notes, spread_mode, spread_floor_soft
-       from lms_competitions where id = $1 and user_id = $2`,
-    [id, userId],
+    spread_mode: LmsSpreadMode | null;
+    spread_floor_soft: string | null; // numeric — coerce with Number()
+  };
+  const compRows = await tolerateMissingSchema(
+    "getCompetition",
+    () =>
+      q<CompRow>(
+        `select id, user_id, name, start_gw, notes, spread_mode, spread_floor_soft
+           from lms_competitions where id = $1 and user_id = $2`,
+        [id, userId],
+      ),
+    // spread_mode / spread_floor_soft not added yet -> pre-005 defaults below.
+    () =>
+      q<CompRow>(
+        `select id, user_id, name, start_gw, notes,
+                null as spread_mode, null as spread_floor_soft
+           from lms_competitions where id = $1 and user_id = $2`,
+        [id, userId],
+      ),
   );
   const c = compRows[0];
   if (!c) return null;
@@ -568,8 +622,8 @@ export async function getCompetition(
       strategy: e.reserve_strategy,
       picksCount: Number(e.picks_count),
     })),
-    spreadMode: c.spread_mode,
-    spreadFloorSoft: Number(c.spread_floor_soft),
+    spreadMode: c.spread_mode ?? "off",
+    spreadFloorSoft: c.spread_floor_soft != null ? Number(c.spread_floor_soft) : 0.65,
   };
 }
 
@@ -598,21 +652,36 @@ export async function getEntry(
   const e = entryRows[0];
   if (!e) return null;
 
+  type PickRow = {
+    gw: number;
+    team_id: number;
+    result: LmsPickResult;
+    is_backfill: boolean;
+    spread_source: LmsSpreadSource;
+    team: Team | null;
+  };
   const [pickRows, reserveRows, teams] = await Promise.all([
-    q<{
-      gw: number;
-      team_id: number;
-      result: LmsPickResult;
-      is_backfill: boolean;
-      spread_source: LmsSpreadSource;
-      team: Team | null;
-    }>(
-      `select p.gw, p.team_id, p.result, p.is_backfill, p.spread_source,
-              to_jsonb(t.*) as team
-         from lms_entry_picks p
-         left join teams t on t.fpl_id = p.team_id
-        where p.entry_id = $1 order by p.gw asc`,
-      [id],
+    tolerateMissingSchema(
+      "getEntry.picks",
+      () =>
+        q<PickRow>(
+          `select p.gw, p.team_id, p.result, p.is_backfill, p.spread_source,
+                  to_jsonb(t.*) as team
+             from lms_entry_picks p
+             left join teams t on t.fpl_id = p.team_id
+            where p.entry_id = $1 order by p.gw asc`,
+          [id],
+        ),
+      // spread_source column not added yet -> null provenance.
+      () =>
+        q<PickRow>(
+          `select p.gw, p.team_id, p.result, p.is_backfill,
+                  null as spread_source, to_jsonb(t.*) as team
+             from lms_entry_picks p
+             left join teams t on t.fpl_id = p.team_id
+            where p.entry_id = $1 order by p.gw asc`,
+          [id],
+        ),
     ),
     q<{ team_id: number }>(
       `select team_id from lms_entry_reserves where entry_id = $1`,
@@ -821,12 +890,19 @@ async function getAliveEntryInputs(
 async function getSpreadOverrides(
   competitionId: number,
 ): Promise<SpreadOverride[]> {
-  const rows = await q<{ gw: number; force_same: boolean }>(
-    `select gw, force_same from lms_competition_spread_overrides
-      where competition_id = $1`,
-    [competitionId],
+  return tolerateMissingSchema(
+    "getSpreadOverrides",
+    async () => {
+      const rows = await q<{ gw: number; force_same: boolean }>(
+        `select gw, force_same from lms_competition_spread_overrides
+          where competition_id = $1`,
+        [competitionId],
+      );
+      return rows.map((r) => ({ gw: r.gw, forceSame: r.force_same }));
+    },
+    // lms_competition_spread_overrides table not created yet -> no overrides.
+    async () => [],
   );
-  return rows.map((r) => ({ gw: r.gw, forceSame: r.force_same }));
 }
 
 // The bundle of inputs the pure planner (lib/lmsPlanner.ts) needs. Assembled
@@ -853,21 +929,36 @@ export async function getForwardPlanInputs(
   entryId: number,
   userId: number,
 ): Promise<ForwardPlanInputs | null> {
-  const entryRows = await q<{
+  type EntryRow = {
     id: number;
     competition_id: number;
     start_gw: number;
     reserve_strategy: LmsReserveStrategy;
     confidence_floor: string;
-    spread_mode: LmsSpreadMode;
-    spread_floor_soft: string;
-  }>(
-    `select e.id, e.competition_id, c.start_gw, e.reserve_strategy, e.confidence_floor,
-            c.spread_mode, c.spread_floor_soft
-       from lms_entries e
-       join lms_competitions c on c.id = e.competition_id
-      where e.id = $1 and c.user_id = $2`,
-    [entryId, userId],
+    spread_mode: LmsSpreadMode | null;
+    spread_floor_soft: string | null;
+  };
+  const entryRows = await tolerateMissingSchema(
+    "getForwardPlanInputs",
+    () =>
+      q<EntryRow>(
+        `select e.id, e.competition_id, c.start_gw, e.reserve_strategy, e.confidence_floor,
+                c.spread_mode, c.spread_floor_soft
+           from lms_entries e
+           join lms_competitions c on c.id = e.competition_id
+          where e.id = $1 and c.user_id = $2`,
+        [entryId, userId],
+      ),
+    // spread_mode / spread_floor_soft not added yet -> pre-005 defaults below.
+    () =>
+      q<EntryRow>(
+        `select e.id, e.competition_id, c.start_gw, e.reserve_strategy, e.confidence_floor,
+                null as spread_mode, null as spread_floor_soft
+           from lms_entries e
+           join lms_competitions c on c.id = e.competition_id
+          where e.id = $1 and c.user_id = $2`,
+        [entryId, userId],
+      ),
   );
   const e = entryRows[0];
   if (!e) return null;
@@ -899,8 +990,8 @@ export async function getForwardPlanInputs(
     teams: globals.teams,
     eliteSet: globals.eliteSet,
     competitionId: e.competition_id,
-    spreadMode: e.spread_mode,
-    spreadFloorSoft: Number(e.spread_floor_soft),
+    spreadMode: e.spread_mode ?? "off",
+    spreadFloorSoft: e.spread_floor_soft != null ? Number(e.spread_floor_soft) : 0.65,
     spreadOverrides,
     aliveEntries,
   };
@@ -915,18 +1006,33 @@ export async function getCompetitionSpreadView(
   userId: number,
   gw: number,
 ): Promise<LmsCompetitionSpreadView | null> {
-  const compRows = await q<{
+  type SpreadCompRow = {
     id: number;
     start_gw: number;
-    spread_mode: LmsSpreadMode;
-    spread_floor_soft: string;
-  }>(
-    `select id, start_gw, spread_mode, spread_floor_soft
-       from lms_competitions where id = $1 and user_id = $2`,
-    [competitionId, userId],
+    spread_mode: LmsSpreadMode | null;
+    spread_floor_soft: string | null;
+  };
+  const compRows = await tolerateMissingSchema(
+    "getCompetitionSpreadView",
+    () =>
+      q<SpreadCompRow>(
+        `select id, start_gw, spread_mode, spread_floor_soft
+           from lms_competitions where id = $1 and user_id = $2`,
+        [competitionId, userId],
+      ),
+    // spread_mode / spread_floor_soft not added yet -> spread off, default floor.
+    () =>
+      q<SpreadCompRow>(
+        `select id, start_gw, null as spread_mode, null as spread_floor_soft
+           from lms_competitions where id = $1 and user_id = $2`,
+        [competitionId, userId],
+      ),
   );
   const c = compRows[0];
   if (!c) return null;
+  const spreadMode: LmsSpreadMode = c.spread_mode ?? "off";
+  const spreadFloorSoft =
+    c.spread_floor_soft != null ? Number(c.spread_floor_soft) : 0.65;
 
   const [globals, aliveEntries, spreadOverrides] = await Promise.all([
     getCompetitionGlobals(c.start_gw),
@@ -960,8 +1066,8 @@ export async function getCompetitionSpreadView(
     fixtureProbs: globals.fixtureProbs,
     teams: globals.teams,
     eliteSet: globals.eliteSet,
-    spreadMode: c.spread_mode,
-    spreadFloorSoft: Number(c.spread_floor_soft),
+    spreadMode,
+    spreadFloorSoft,
     overrides: spreadOverrides,
   });
   const plannedByEntry = new Map<
@@ -1003,7 +1109,7 @@ export async function getCompetitionSpreadView(
   return {
     competitionId,
     gw,
-    spreadMode: c.spread_mode,
+    spreadMode,
     forceSame: spreadOverrides.some((o) => o.gw === gw && o.forceSame),
     entries,
     duplicateTeamIds,
