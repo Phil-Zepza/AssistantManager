@@ -132,11 +132,17 @@ create table if not exists model_player_ep (
 
 create table if not exists model_fixture_probs (
   fixture_id  int references fixtures(fpl_id) primary key,
+  -- p_* is the SHOWN distribution every reader/planner uses: = market when the
+  -- book has priced the fixture, = model otherwise (market-when-priced hard
+  -- switch — see 006 migration). model_p_* is the model's own canonical view.
   p_home real, p_draw real, p_away real,
+  model_p_home real, model_p_draw real, model_p_away real,
   exp_goals_h real, exp_goals_a real,
   computed_at timestamptz default now(),
-  -- bookmaker odds calibration (QA only, NOT a model input) — see 004 migration.
-  -- Median across UK books, de-vigged; divergence on the model's favoured win side.
+  -- de-vigged bookmaker market (median across UK books) — see 004 + 006 migrations.
+  -- market_available = true once the odds step matched a book for this fixture;
+  -- divergence is model_p_* vs market_p_* on the model's favoured win side.
+  market_available   boolean,
   market_p_home      real,
   market_p_draw      real,
   market_p_away      real,
@@ -161,6 +167,21 @@ create table if not exists team_squad_value_index (
 
 create index if not exists team_squad_value_index_gw_idx
   on team_squad_value_index (gw);
+
+-- Append-only pipeline health markers — see 006 migration. The odds step writes an
+-- 'error' row (committed immediately) on any outage (missing ODDS_API_KEY, failed
+-- or empty fetch) so a degraded run is impossible to miss, and an 'ok' row on
+-- success. The run still completes on the model fallback.
+create table if not exists pipeline_health (
+  id         bigint generated always as identity primary key,
+  step       text not null,
+  status     text not null,        -- 'ok' | 'error'
+  detail     text,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists pipeline_health_step_created_idx
+  on pipeline_health (step, created_at desc);
 
 create table if not exists gameweeks (
   gw           int primary key,
