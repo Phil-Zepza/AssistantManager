@@ -237,17 +237,19 @@ function FormPips({ form }: { form: ("W" | "D" | "L")[] }) {
 
 /**
  * Always-on scouting glance for one team: recent form, top scorers and team
- * xG. Falls back to last-season numbers (clearly labelled) until current-season
- * games have been played. Data comes from player_season_stats / fixtures.
+ * xG. Shows only current-season data once games have been played; before that,
+ * renders a pending state instead of falling back to last-season numbers.
+ * Data comes from player_season_stats / fixtures.
+ *
+ * NOTE: This reverses an earlier decision to fall back to labelled last-season
+ * stats. The new rule: no current-season data → pending state, not last-season.
  */
 function ScoutingDetail({
   scouting,
 }: {
   scouting: TeamScouting | undefined;
 }) {
-  const hasStats = scouting != null && scouting.season !== "none";
-
-  if (!scouting || (!hasStats && scouting.form.length === 0)) {
+  if (scouting == null) {
     return (
       <p className="text-[11px] text-muted">
         Detail appears after the next data run.
@@ -255,7 +257,15 @@ function ScoutingDetail({
     );
   }
 
-  const isLast = scouting.season === "last";
+  // No current-season minutes yet (season === "last" or "none") — show a clear
+  // pending state rather than displaying last-season numbers without context.
+  if (scouting.season !== "current") {
+    return (
+      <p className="text-[11px] text-muted">
+        No current-season data yet — check back after kickoff.
+      </p>
+    );
+  }
 
   return (
     <div className="space-y-2.5">
@@ -265,11 +275,6 @@ function ScoutingDetail({
           Form
         </span>
         <FormPips form={scouting.form} />
-        {isLast && (
-          <Badge tone="gray">
-            last season{scouting.seasonLabel ? ` · ${scouting.seasonLabel}` : ""}
-          </Badge>
-        )}
       </div>
 
       <div className="flex items-start justify-between gap-4">
@@ -1042,19 +1047,6 @@ function FixtureRow({
   // Backable side of this fixture (favoured available team; null if none).
   const pick = pickFromFixture(f, usedTeamIds);
 
-  // Market-divergence flag: when the model and the bookmakers disagree by > 15pp
-  // on the model's favoured win side, surface both numbers so it can be sanity-
-  // checked by eye. Reads model_p_* vs market_p_* — the shown p_* has already
-  // switched to the market for priced fixtures, so comparing p_* would be a no-op.
-  const favHome = (f.modelPHome ?? 0) >= (f.modelPAway ?? 0);
-  const favModelP = favHome ? f.modelPHome : f.modelPAway;
-  const favMarketP = favHome ? f.marketPHome : f.marketPAway;
-  const showDivergence =
-    f.marketDivergence != null &&
-    f.marketDivergence > 0.15 &&
-    favModelP != null &&
-    favMarketP != null;
-
   // Market-unavailable flag: no book has priced this fixture (usually a future
   // round), so the shown p_* is the model estimate rather than the market.
   const marketUnavailable =
@@ -1138,14 +1130,6 @@ function FixtureRow({
           </Button>
         )}
       </div>
-
-      {showDivergence && (
-        <div className="mt-2 flex justify-center">
-          <Badge tone="warning">
-            {`Model ${formatPct(favModelP)} · Market ${formatPct(favMarketP)} — worth a look`}
-          </Badge>
-        </div>
-      )}
 
       {marketUnavailable && (
         <div className="mt-2 flex justify-center">
@@ -2812,6 +2796,9 @@ function PinPickerSheet({
             </button>
           ))
         )}
+        <Button variant="ghost" onClick={onClose} fullWidth>
+          Cancel
+        </Button>
       </div>
     </BottomSheet>
   );
