@@ -35,6 +35,7 @@ import {
   computeDefaultDeadline,
   computeEliteSet,
   type CompetitionEntryInput,
+  type PlannerCompetition,
   type PlannerEntryState,
   type PlannerFixtureProb,
   type PlannerRound,
@@ -594,19 +595,22 @@ export async function getCompetition(
   const c = compRows[0];
   if (!c) return null;
 
-  const entries = await q<{
-    id: number;
-    label: string;
-    status: LmsEntryStatus;
-    eliminated_gw: number | null;
-    reserve_strategy: LmsReserveStrategy;
-    picks_count: string;
-  }>(
-    `select e.id, e.label, e.status, e.eliminated_gw, e.reserve_strategy,
-            (select count(*) from lms_entry_picks p where p.entry_id = e.id) as picks_count
-       from lms_entries e where e.competition_id = $1 order by e.id asc`,
-    [id],
-  );
+  const [entries, skip] = await Promise.all([
+    q<{
+      id: number;
+      label: string;
+      status: LmsEntryStatus;
+      eliminated_gw: number | null;
+      reserve_strategy: LmsReserveStrategy;
+      picks_count: string;
+    }>(
+      `select e.id, e.label, e.status, e.eliminated_gw, e.reserve_strategy,
+              (select count(*) from lms_entry_picks p where p.entry_id = e.id) as picks_count
+         from lms_entries e where e.competition_id = $1 order by e.id asc`,
+      [id],
+    ),
+    getCompetitionSkip(id),
+  ]);
 
   return {
     id: c.id,
@@ -624,6 +628,8 @@ export async function getCompetition(
     })),
     spreadMode: c.spread_mode ?? "off",
     spreadFloorSoft: c.spread_floor_soft != null ? Number(c.spread_floor_soft) : 0.65,
+    autoSkipUnderFixtures: skip.autoSkipUnderFixtures,
+    skippedRounds: [...skip.skippedRounds],
   };
 }
 
@@ -889,6 +895,44 @@ async function getAliveEntryInputs(
   }));
 }
 
+// Per-competition skip config (auto-skip threshold + manual skips), shaped for the
+// pure planner. Each new-schema read is INDEPENDENTLY tolerant of the pre-007 DB
+// (migrations lag web deploys), degrading to today's global rule: threshold 7 (so
+// the live EPL LMS still skips sub-7 rounds) and no manual skips. Kept separate from
+// the spread-column reads above so a missing auto_skip column never nulls spread.
+export async function getCompetitionSkip(
+  competitionId: number,
+): Promise<PlannerCompetition> {
+  const autoSkipUnderFixtures = await tolerateMissingSchema(
+    "getCompetitionSkip.threshold",
+    async () => {
+      const rows = await q<{ auto_skip_under_fixtures: number | null }>(
+        `select auto_skip_under_fixtures from lms_competitions where id = $1`,
+        [competitionId],
+      );
+      // NULL column value = "no fixture-count rule" for this competition. A missing
+      // row (should not happen for owned competitions) also yields null.
+      return rows[0]?.auto_skip_under_fixtures ?? null;
+    },
+    // auto_skip_under_fixtures column not added yet -> replicate today's sub-7 rule.
+    async () => 7,
+  );
+  const skippedRounds = await tolerateMissingSchema(
+    "getCompetitionSkip.rounds",
+    async () => {
+      const rows = await q<{ gw: number; reason: string | null }>(
+        `select gw, reason from lms_competition_skipped_rounds
+          where competition_id = $1 order by gw asc`,
+        [competitionId],
+      );
+      return rows.map((r) => ({ gw: r.gw, reason: r.reason }));
+    },
+    // lms_competition_skipped_rounds table not created yet -> no manual skips.
+    async () => [],
+  );
+  return { autoSkipUnderFixtures, skippedRounds };
+}
+
 // Per-round force_same overrides for a competition (only rows with force_same=true).
 async function getSpreadOverrides(
   competitionId: number,
@@ -926,6 +970,9 @@ export interface ForwardPlanInputs {
   spreadFloorSoft: number;
   spreadOverrides: SpreadOverride[];
   aliveEntries: AliveEntryInput[];
+  // Per-competition skip config, fed to both computeForwardPlan and
+  // computeCompetitionPlan so the client recomputes skips live on override.
+  competition: PlannerCompetition;
 }
 
 export async function getForwardPlanInputs(
@@ -966,7 +1013,7 @@ export async function getForwardPlanInputs(
   const e = entryRows[0];
   if (!e) return null;
 
-  const [usedRows, reserveRows, globals, aliveEntries, spreadOverrides] =
+  const [usedRows, reserveRows, globals, aliveEntries, spreadOverrides, competition] =
     await Promise.all([
       q<{ team_id: number }>(
         `select team_id from lms_entry_picks where entry_id = $1`,
@@ -979,6 +1026,7 @@ export async function getForwardPlanInputs(
       getCompetitionGlobals(e.start_gw),
       getAliveEntryInputs(e.competition_id),
       getSpreadOverrides(e.competition_id),
+      getCompetitionSkip(e.competition_id),
     ]);
 
   return {
@@ -997,6 +1045,7 @@ export async function getForwardPlanInputs(
     spreadFloorSoft: e.spread_floor_soft != null ? Number(e.spread_floor_soft) : 0.65,
     spreadOverrides,
     aliveEntries,
+    competition,
   };
 }
 
@@ -1037,10 +1086,11 @@ export async function getCompetitionSpreadView(
   const spreadFloorSoft =
     c.spread_floor_soft != null ? Number(c.spread_floor_soft) : 0.65;
 
-  const [globals, aliveEntries, spreadOverrides] = await Promise.all([
+  const [globals, aliveEntries, spreadOverrides, competition] = await Promise.all([
     getCompetitionGlobals(c.start_gw),
     getAliveEntryInputs(competitionId),
     getSpreadOverrides(competitionId),
+    getCompetitionSkip(competitionId),
   ]);
 
   const teamByFplId = new Map<number, Team>();
@@ -1072,6 +1122,7 @@ export async function getCompetitionSpreadView(
     spreadMode,
     spreadFloorSoft,
     overrides: spreadOverrides,
+    competition,
   });
   const plannedByEntry = new Map<
     number,

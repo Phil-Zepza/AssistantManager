@@ -231,7 +231,10 @@ create table if not exists lms_competitions (
   created_at        timestamptz default now(),
   -- Cross-entry variance ("Spread picks across entries"). See db/migrations/005.
   spread_mode       text not null default 'off',      -- 'off' | 'soft' | 'strong'
-  spread_floor_soft numeric not null default 0.65      -- Soft floor (Strong ignores it)
+  spread_floor_soft numeric not null default 0.65,     -- Soft floor (Strong ignores it)
+  -- Per-competition auto-skip: rounds with fewer than this many PL fixtures are
+  -- skipped for this competition. NULL = no fixture-count rule. See db/migrations/007.
+  auto_skip_under_fixtures int default 7
 );
 
 create table if not exists lms_competition_deadlines (
@@ -250,6 +253,20 @@ create table if not exists lms_competition_spread_overrides (
   force_same     boolean not null default true,
   primary key (competition_id, gw)
 );
+
+-- Per-round MANUAL skip: one row per round a user has manually excluded from a
+-- competition's forward plan (any reason, reversible). Distinct from the fixture
+-- count auto-skip above. See db/migrations/007.
+create table if not exists lms_competition_skipped_rounds (
+  competition_id int not null references lms_competitions(id) on delete cascade,
+  gw             int not null,
+  reason         text,
+  created_at     timestamptz not null default now(),
+  primary key (competition_id, gw)
+);
+
+create index if not exists lms_competition_skipped_rounds_competition_idx
+  on lms_competition_skipped_rounds (competition_id);
 
 create table if not exists lms_entries (
   id               serial primary key,

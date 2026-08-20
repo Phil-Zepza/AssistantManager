@@ -286,6 +286,16 @@ export interface LmsCompetition {
   created_at: string;
   spread_mode: LmsSpreadMode;
   spread_floor_soft: number; // numeric — MUST be Number()-coerced in the query layer
+  // Rounds with fewer than this many PL fixtures are auto-skipped. null = no rule.
+  auto_skip_under_fixtures: number | null;
+}
+
+// A per-round MANUAL skip (lms_competition_skipped_rounds).
+export interface LmsCompetitionSkippedRound {
+  competition_id: number;
+  gw: number;
+  reason: string | null;
+  created_at: string;
 }
 
 // A per-round "use the same team across entries" override (lms_competition_spread_overrides).
@@ -360,6 +370,11 @@ export interface LmsCompetitionDetail {
   entries: LmsEntrySummary[];
   spreadMode: LmsSpreadMode;
   spreadFloorSoft: number;
+  // Per-competition auto-skip threshold: rounds below this fixture count are
+  // skipped. null = no fixture-count rule for this competition.
+  autoSkipUnderFixtures: number | null;
+  // Manually-skipped rounds for this competition (gw + optional reason).
+  skippedRounds: { gw: number; reason: string | null }[];
 }
 
 // One submitted pick joined with its team for display.

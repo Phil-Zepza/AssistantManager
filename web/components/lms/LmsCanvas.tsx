@@ -416,6 +416,7 @@ export function LmsCanvas({
       spreadMode: spreadMode as "off" | "soft" | "strong",
       spreadFloorSoft: compDetail?.competition.spreadFloorSoft ?? 0.65,
       overrides: planInputs.spreadOverrides,
+      competition: planInputs.competition,
     });
   }, [planInputs, selectedEntryId, pins, spreadMode, compDetail?.competition.spreadFloorSoft]);
 
@@ -1624,11 +1625,18 @@ function PlanTile({
   const isNoPick = flags.includes("noPick");
 
   if (isSkipped) {
+    // skipKind tells auto (fixture-count threshold) from manual (user skip). The
+    // short label is the reason up to the em-dash ("under 7 fixtures", the user's
+    // reason, or "manually skipped"); the full reason is the tooltip.
+    const shortReason = pick.reason.split(" — ")[0];
     return (
-      <div className="flex w-28 shrink-0 flex-col items-center justify-center rounded-lg border border-dashed border-subtle bg-surface/50 px-2 py-3 text-center opacity-50">
+      <div
+        className="flex w-28 shrink-0 flex-col items-center justify-center rounded-lg border border-dashed border-subtle bg-surface/50 px-2 py-3 text-center opacity-50"
+        title={pick.reason}
+      >
         <span className="text-xs font-semibold text-muted">GW{pick.gw}</span>
         <span className="mt-0.5 text-[10px] text-muted leading-tight">
-          Skipped · under 7
+          Skipped · {shortReason}
         </span>
       </div>
     );

@@ -3,10 +3,14 @@ import {
   computeForwardPlan,
   computeEliteSet,
   computeDefaultDeadline,
+  roundSkipStatus,
+  isRoundSkipped,
+  qualifyingRounds,
   type PlannerTeam,
   type PlannerRound,
   type PlannerFixtureProb,
   type PlannerEntryState,
+  type PlannerCompetition,
   type PlannedPick,
 } from "./lmsPlanner";
 
@@ -29,8 +33,19 @@ const TEAMS: PlannerTeam[] = [
 ];
 const ELITE = computeEliteSet(TEAMS, 4); // [1,2,3,4]
 
-function round(gw: number, lmsEligible = true, numFixtures = 10): PlannerRound {
+// numFixtures now drives skip (>= threshold), so keep it consistent with the
+// legacy lmsEligible flag: eligible rounds get 10 fixtures, ineligible get 5.
+function round(
+  gw: number,
+  lmsEligible = true,
+  numFixtures = lmsEligible ? 10 : 5,
+): PlannerRound {
   return { gw, lmsEligible, numFixtures };
+}
+
+// A per-competition skip config. Defaults to today's global rule (threshold 7).
+function comp(overrides: Partial<PlannerCompetition> = {}): PlannerCompetition {
+  return { autoSkipUnderFixtures: 7, skippedRounds: [], ...overrides };
 }
 
 let fixtureSeq = 1000;
@@ -300,6 +315,160 @@ describe("sub-7 skip", () => {
     expect(g.get(2)?.teamId).toBeNull();
     expect(g.get(2)?.flags).toEqual(["skipped"]);
     // team 5 was NOT consumed by the skipped gw2, so it is still available in gw3
+    expect(g.get(3)?.teamId).toBe(5);
+  });
+});
+
+// ---------- per-competition skip (auto threshold + manual skips) ----------
+
+describe("roundSkipStatus helper", () => {
+  it("auto-skips only when the threshold is set and numFixtures < threshold", () => {
+    expect(roundSkipStatus(round(1, true, 6), comp({ autoSkipUnderFixtures: 7 }))).toEqual({
+      skipped: true,
+      kind: "auto",
+      reason: "under 7 fixtures — does not count for LMS",
+    });
+    expect(isRoundSkipped(round(1, true, 7), comp({ autoSkipUnderFixtures: 7 }))).toBe(false);
+    expect(isRoundSkipped(round(1, true, 8), comp({ autoSkipUnderFixtures: 7 }))).toBe(false);
+  });
+
+  it("threshold null never auto-skips — a 5-game round qualifies", () => {
+    expect(isRoundSkipped(round(1, true, 5), comp({ autoSkipUnderFixtures: null }))).toBe(false);
+  });
+
+  it("honours a custom threshold", () => {
+    expect(isRoundSkipped(round(1, true, 8), comp({ autoSkipUnderFixtures: 10 }))).toBe(true);
+    expect(isRoundSkipped(round(1, true, 10), comp({ autoSkipUnderFixtures: 10 }))).toBe(false);
+  });
+
+  it("treats null numFixtures as below any threshold (pre-migration behaviour)", () => {
+    expect(isRoundSkipped({ gw: 1, lmsEligible: false, numFixtures: null }, comp())).toBe(true);
+  });
+
+  it("manual skip drops a round regardless of fixture count, carrying its reason", () => {
+    const c = comp({ autoSkipUnderFixtures: null, skippedRounds: [{ gw: 3, reason: "cup week" }] });
+    expect(roundSkipStatus(round(3, true, 10), c)).toEqual({
+      skipped: true,
+      kind: "manual",
+      reason: "cup week",
+    });
+  });
+
+  it("manual skip with no reason falls back to a default label", () => {
+    const c = comp({ skippedRounds: [{ gw: 2, reason: null }] });
+    expect(roundSkipStatus(round(2, true, 10), c)).toEqual({
+      skipped: true,
+      kind: "manual",
+      reason: "manually skipped — does not count for LMS",
+    });
+  });
+
+  it("manual takes precedence over auto when both apply", () => {
+    const c = comp({ autoSkipUnderFixtures: 7, skippedRounds: [{ gw: 2, reason: "x" }] });
+    const s = roundSkipStatus(round(2, false, 5), c);
+    expect(s).toEqual({ skipped: true, kind: "manual", reason: "x" });
+  });
+
+  it("qualifyingRounds with the default (threshold 7) matches the legacy lms_eligible filter", () => {
+    const rounds = [round(1, true, 10), round(2, false, 5), round(3, true, 7), round(4, true, 6)];
+    const viaHelper = qualifyingRounds(rounds, comp()).map((r) => r.gw);
+    const legacy = rounds.filter((r) => (r.numFixtures ?? 0) >= 7).map((r) => r.gw);
+    expect(viaHelper).toEqual(legacy);
+    expect(viaHelper).toEqual([1, 3]);
+  });
+});
+
+describe("computeForwardPlan · per-competition skip", () => {
+  const probs = [
+    prob(1, 6, 8, 0.75, 0.15),
+    prob(2, 5, 7, 0.95, 0.03),
+    prob(3, 5, 7, 0.8, 0.12),
+  ];
+
+  it("threshold null keeps a low-fixture round in the plan (no auto-skip)", () => {
+    const g = byGw(
+      computeForwardPlan({
+        entryState: state(),
+        upcomingRounds: [round(1, true, 10), round(2, false, 5), round(3, true, 10)],
+        fixtureProbs: probs,
+        teams: TEAMS,
+        eliteSet: ELITE,
+        competition: comp({ autoSkipUnderFixtures: null }),
+      }).picks,
+    );
+    expect(g.get(2)?.flags).not.toContain("skipped");
+    expect(g.get(2)?.teamId).toBe(5); // best 0.95 side spent in the (now qualifying) gw2
+  });
+
+  it("a manual skip drops an otherwise-qualifying round (skipKind:'manual' + reason)", () => {
+    const g = byGw(
+      computeForwardPlan({
+        entryState: state(),
+        upcomingRounds: [round(1), round(2), round(3)],
+        fixtureProbs: probs,
+        teams: TEAMS,
+        eliteSet: ELITE,
+        competition: comp({ skippedRounds: [{ gw: 2, reason: "organiser called it off" }] }),
+      }).picks,
+    );
+    expect(g.get(2)?.teamId).toBeNull();
+    expect(g.get(2)?.flags).toEqual(["skipped"]);
+    expect(g.get(2)?.skipKind).toBe("manual");
+    expect(g.get(2)?.reason).toBe("organiser called it off");
+    // team 5 not consumed by the skipped gw2, so still available in gw3.
+    expect(g.get(3)?.teamId).toBe(5);
+  });
+
+  it("unskipping (removing the manual entry) restores the round to the plan", () => {
+    const base = {
+      entryState: state(),
+      upcomingRounds: [round(1), round(2), round(3)],
+      fixtureProbs: probs,
+      teams: TEAMS,
+      eliteSet: ELITE,
+    };
+    const skipped = byGw(
+      computeForwardPlan({ ...base, competition: comp({ skippedRounds: [{ gw: 2, reason: null }] }) }).picks,
+    );
+    expect(skipped.get(2)?.flags).toContain("skipped");
+    const restored = byGw(
+      computeForwardPlan({ ...base, competition: comp({ skippedRounds: [] }) }).picks,
+    );
+    expect(restored.get(2)?.flags).not.toContain("skipped");
+    expect(restored.get(2)?.teamId).toBe(5);
+  });
+
+  it("auto and manual skips on different rounds coexist with correct skipKind", () => {
+    const g = byGw(
+      computeForwardPlan({
+        entryState: state(),
+        upcomingRounds: [round(1, true, 10), round(2, false, 5), round(3, true, 10)],
+        fixtureProbs: probs,
+        teams: TEAMS,
+        eliteSet: ELITE,
+        competition: comp({ autoSkipUnderFixtures: 7, skippedRounds: [{ gw: 3, reason: "double" }] }),
+      }).picks,
+    );
+    expect(g.get(2)?.skipKind).toBe("auto");
+    expect(g.get(2)?.reason).toBe("under 7 fixtures — does not count for LMS");
+    expect(g.get(3)?.skipKind).toBe("manual");
+    expect(g.get(3)?.reason).toBe("double");
+  });
+
+  it("regression: default competition reproduces the sub-7 auto-skip exactly", () => {
+    const g = byGw(
+      computeForwardPlan({
+        entryState: state(),
+        upcomingRounds: [round(1, true, 10), round(2, false, 5), round(3, true, 10)],
+        fixtureProbs: probs,
+        teams: TEAMS,
+        eliteSet: ELITE,
+        // no competition -> DEFAULT_COMPETITION (threshold 7)
+      }).picks,
+    );
+    expect(g.get(2)?.teamId).toBeNull();
+    expect(g.get(2)?.flags).toEqual(["skipped"]);
+    expect(g.get(2)?.skipKind).toBe("auto");
     expect(g.get(3)?.teamId).toBe(5);
   });
 });

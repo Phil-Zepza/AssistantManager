@@ -16,7 +16,8 @@ import type {
   Position,
   SquadSelection,
 } from "@/lib/types";
-import { autoSoftApplies } from "@/lib/lmsPlanner";
+import { autoSoftApplies, roundSkipStatus } from "@/lib/lmsPlanner";
+import { getCompetitionSkip } from "@/lib/queries";
 
 // Send a magic-link email via the Resend provider. Returns a status object so
 // the login page can show "check your email" without a full-page redirect.
@@ -545,17 +546,31 @@ export async function submitPick(
     return { ok: false, error: "This entry is already out." };
   }
 
-  // Round must exist, be LMS-eligible and not finished.
-  const gwRows = await q<{ lms_eligible: boolean; finished: boolean }>(
-    `select lms_eligible, finished from gameweeks where gw = $1`,
+  // Round must exist, not be finished, and not be skipped FOR THIS COMPETITION.
+  // The skip decision uses the same per-competition helper as the planner (auto
+  // threshold + manual skips), NOT the global gameweeks.lms_eligible flag — so a
+  // competition that turns its threshold off (or manually skips a round) stays
+  // consistent between the plan and what submitPick accepts.
+  const gwRows = await q<{ num_fixtures: number | null; finished: boolean }>(
+    `select num_fixtures, finished from gameweeks where gw = $1`,
     [roundGw],
   );
   if (gwRows.length === 0) return { ok: false, error: "Unknown round." };
-  if (!gwRows[0].lms_eligible) {
-    return { ok: false, error: "Round has fewer than 7 fixtures." };
-  }
   if (gwRows[0].finished) {
     return { ok: false, error: "That round is already finished." };
+  }
+  const skip = roundSkipStatus(
+    { gw: roundGw, lmsEligible: true, numFixtures: gwRows[0].num_fixtures },
+    await getCompetitionSkip(entry.competition_id),
+  );
+  if (skip.skipped) {
+    return {
+      ok: false,
+      error:
+        skip.kind === "manual"
+          ? "That round is skipped for this competition."
+          : "Round has too few fixtures to count for this competition.",
+    };
   }
 
   // The backed team must play in this round.
@@ -792,6 +807,110 @@ export async function setSpreadOverride(
       [compId, roundGw],
     );
   }
+  revalidatePath("/lms");
+  return { ok: true };
+}
+
+// Set (or clear) a competition's fixture-count auto-skip threshold. n = the
+// minimum PL fixtures a round needs to count; rounds below it are auto-skipped.
+// n = null turns the fixture-count rule off (sub-N rounds then count). Our DB
+// only; ownership-checked. Recompute is live client-side — nothing about picks is
+// persisted here.
+export async function setAutoSkipThreshold(
+  competitionId: number,
+  n: number | null,
+): Promise<{ ok: boolean; error?: string }> {
+  const session = await auth();
+  const userId = session?.user?.id;
+  if (!userId) throw new Error("Not authenticated");
+
+  const compId = Number(competitionId);
+  if (!Number.isInteger(compId) || compId <= 0) {
+    return { ok: false, error: "Invalid competition." };
+  }
+  let value: number | null = null;
+  if (n != null) {
+    const t = Number(n);
+    if (!Number.isInteger(t) || t < 1) {
+      return { ok: false, error: "Threshold must be a positive whole number, or off." };
+    }
+    value = t;
+  }
+  if (!(await competitionOwned(userId, compId))) {
+    return { ok: false, error: "Competition not found." };
+  }
+
+  await q(`update lms_competitions set auto_skip_under_fixtures = $1 where id = $2`, [
+    value,
+    compId,
+  ]);
+  revalidatePath("/lms");
+  return { ok: true };
+}
+
+// Manually skip a round for a competition (any reason, reversible). Upserts one
+// row in lms_competition_skipped_rounds; idempotent. reason is optional free text
+// surfaced on the forward-plan tile. Our DB only; ownership-checked.
+export async function skipRound(
+  competitionId: number,
+  gw: number,
+  reason?: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const session = await auth();
+  const userId = session?.user?.id;
+  if (!userId) throw new Error("Not authenticated");
+
+  const compId = Number(competitionId);
+  const roundGw = Number(gw);
+  if (!Number.isInteger(compId) || compId <= 0) {
+    return { ok: false, error: "Invalid competition." };
+  }
+  if (!Number.isInteger(roundGw) || roundGw <= 0) {
+    return { ok: false, error: "Invalid round." };
+  }
+  const trimmed = reason?.trim();
+  const value = trimmed && trimmed.length > 0 ? trimmed : null;
+  if (!(await competitionOwned(userId, compId))) {
+    return { ok: false, error: "Competition not found." };
+  }
+
+  await q(
+    `insert into lms_competition_skipped_rounds (competition_id, gw, reason)
+       values ($1, $2, $3)
+       on conflict (competition_id, gw) do update set reason = excluded.reason`,
+    [compId, roundGw, value],
+  );
+  revalidatePath("/lms");
+  return { ok: true };
+}
+
+// Reverse a manual skip: delete the round's lms_competition_skipped_rounds row.
+// Idempotent (deleting a non-existent skip is a no-op). Our DB only; ownership-checked.
+export async function unskipRound(
+  competitionId: number,
+  gw: number,
+): Promise<{ ok: boolean; error?: string }> {
+  const session = await auth();
+  const userId = session?.user?.id;
+  if (!userId) throw new Error("Not authenticated");
+
+  const compId = Number(competitionId);
+  const roundGw = Number(gw);
+  if (!Number.isInteger(compId) || compId <= 0) {
+    return { ok: false, error: "Invalid competition." };
+  }
+  if (!Number.isInteger(roundGw) || roundGw <= 0) {
+    return { ok: false, error: "Invalid round." };
+  }
+  if (!(await competitionOwned(userId, compId))) {
+    return { ok: false, error: "Competition not found." };
+  }
+
+  await q(
+    `delete from lms_competition_skipped_rounds
+      where competition_id = $1 and gw = $2`,
+    [compId, roundGw],
+  );
   revalidatePath("/lms");
   return { ok: true };
 }
