@@ -11,12 +11,18 @@ import { ONBOARDING_SKIP_COOKIE } from "@/lib/onboarding";
 import { validateSquad, type SquadMember } from "@/lib/squad";
 import type {
   LmsEntryStatus,
+  LmsPickResult,
   LmsSpreadMode,
   LmsSpreadSource,
   Position,
   SquadSelection,
 } from "@/lib/types";
-import { autoSoftApplies, roundSkipStatus } from "@/lib/lmsPlanner";
+import {
+  autoSoftApplies,
+  computeDefaultDeadline,
+  roundSkipStatus,
+} from "@/lib/lmsPlanner";
+import { canMutatePick, validateChangeTarget } from "@/lib/lmsPickGate";
 import { getCompetitionSkip } from "@/lib/queries";
 
 // Send a magic-link email via the Resend provider. Returns a status object so
@@ -608,6 +614,187 @@ export async function submitPick(
   );
   revalidatePath("/lms");
   return { ok: true };
+}
+
+// One round's fixtures + effective deadline, for the server-side Open gate.
+// The effective deadline mirrors the read layer (queries.resolveNextDeadline): a
+// non-null override wins, otherwise the computed default (day before first
+// kickoff). Fixtures carry the teams too, so callers can also check a team plays.
+type GateFixture = {
+  kickoff: string | null;
+  finished: boolean;
+  home_team: number | null;
+  away_team: number | null;
+};
+async function loadRoundGate(
+  competitionId: number,
+  gw: number,
+): Promise<{ fixtures: GateFixture[]; deadline: string | null }> {
+  const [fixtures, overrideRows] = await Promise.all([
+    q<GateFixture>(
+      `select kickoff, finished, home_team, away_team from fixtures where gw = $1`,
+      [gw],
+    ),
+    q<{ deadline: string | null }>(
+      `select deadline from lms_competition_deadlines
+        where competition_id = $1 and gw = $2 and deadline is not null`,
+      [competitionId, gw],
+    ),
+  ]);
+  const deadline =
+    overrideRows[0]?.deadline ??
+    computeDefaultDeadline(
+      gw,
+      fixtures.map((f) => ({ gw, kickoff: f.kickoff })),
+    );
+  return { fixtures, deadline };
+}
+
+// Cancel a pending pick on an OPEN round: delete the lms_entry_picks row so both
+// unique constraints free up and the team returns to the entry's available pool.
+// The Open gate is re-validated server-side against freshly-loaded data before
+// the delete — a client that shows the control past the deadline (render-vs-
+// deadline race) is still refused. Idempotent: cancelling an already-absent pick
+// is a clean no-op. Never touches status/eliminated_gw or a resolved round.
+export async function cancelPick(
+  entryId: number,
+  gw: number,
+): Promise<{ ok: boolean; error?: string }> {
+  const session = await auth();
+  const userId = session?.user?.id;
+  if (!userId) throw new Error("Not authenticated");
+
+  const eId = Number(entryId);
+  const roundGw = Number(gw);
+  if (!Number.isInteger(eId) || eId <= 0) return { ok: false, error: "Invalid entry." };
+  if (!Number.isInteger(roundGw) || roundGw <= 0) {
+    return { ok: false, error: "Invalid round." };
+  }
+
+  const entry = await loadOwnedEntry(userId, eId);
+  if (!entry) return { ok: false, error: "Entry not found." };
+
+  // Idempotent: nothing to cancel is a clean success.
+  const pickRows = await q<{ result: LmsPickResult }>(
+    `select result from lms_entry_picks where entry_id = $1 and gw = $2`,
+    [eId, roundGw],
+  );
+  if (pickRows.length === 0) return { ok: true };
+
+  // Server-enforced Open gate: the round must still be open and the pick pending.
+  const { fixtures, deadline } = await loadRoundGate(entry.competition_id, roundGw);
+  const gate = canMutatePick({
+    deadline,
+    fixtures,
+    nowMs: Date.now(),
+    pickResult: pickRows[0].result,
+  });
+  if (!gate.ok) return { ok: false, error: gate.reason };
+
+  await q(`delete from lms_entry_picks where entry_id = $1 and gw = $2`, [
+    eId,
+    roundGw,
+  ]);
+  revalidatePath("/lms");
+  return { ok: true };
+}
+
+// Switch an OPEN round's pending pick to a different team, in one transaction.
+// Re-validates the Open gate + single-use-per-entry (unique(entry_id, team_id))
+// against row-locked state before the swap, so a control reached past the
+// deadline — or a team already spent in another round — is refused with a clear
+// error. The team_id UPDATE leaves gw/result untouched (stays 'pending') and
+// clears spread_source (this is a manual choice, not a planner allocation).
+export async function changePick(
+  entryId: number,
+  gw: number,
+  newTeamId: number,
+): Promise<{ ok: boolean; error?: string }> {
+  const session = await auth();
+  const userId = session?.user?.id;
+  if (!userId) throw new Error("Not authenticated");
+
+  const eId = Number(entryId);
+  const roundGw = Number(gw);
+  const team = Number(newTeamId);
+  if (!Number.isInteger(eId) || eId <= 0) return { ok: false, error: "Invalid entry." };
+  if (!Number.isInteger(roundGw) || roundGw <= 0) {
+    return { ok: false, error: "Invalid round." };
+  }
+  if (!Number.isInteger(team) || team <= 0) return { ok: false, error: "Invalid team." };
+
+  const entry = await loadOwnedEntry(userId, eId);
+  if (!entry) return { ok: false, error: "Entry not found." };
+
+  // The new team must exist and have a fixture this round. Deadline + fixtures
+  // are read outside the tx (the pick swap can't change them).
+  const { fixtures, deadline } = await loadRoundGate(entry.competition_id, roundGw);
+  const plays = fixtures.some((f) => f.home_team === team || f.away_team === team);
+  if (!plays) return { ok: false, error: "That team has no fixture this round." };
+
+  let result: { ok: boolean; error?: string } = { ok: true };
+  try {
+    await tx(async (client) => {
+      // Lock this entry's picks so a concurrent change/cancel can't race us.
+      const rows = (
+        await client.query<{ gw: number; team_id: number; result: LmsPickResult }>(
+          `select gw, team_id, result from lms_entry_picks
+            where entry_id = $1 for update`,
+          [eId],
+        )
+      ).rows;
+
+      const current = rows.find((p) => p.gw === roundGw);
+      if (!current) {
+        result = { ok: false, error: "No pick to change on this round." };
+        return;
+      }
+
+      // Open gate: round still open AND the pick still pending.
+      const gate = canMutatePick({
+        deadline,
+        fixtures,
+        nowMs: Date.now(),
+        pickResult: current.result,
+      });
+      if (!gate.ok) {
+        result = { ok: false, error: gate.reason };
+        return;
+      }
+
+      // Single-use per entry: reject a team already spent in another round.
+      const target = validateChangeTarget(
+        rows.map((p) => ({ gw: p.gw, teamId: p.team_id })),
+        roundGw,
+        team,
+      );
+      if (!target.ok) {
+        result = { ok: false, error: target.reason };
+        return;
+      }
+      if (target.noop) {
+        // Re-picking this round's own team — nothing to do.
+        result = { ok: true };
+        return;
+      }
+
+      await client.query(
+        `update lms_entry_picks set team_id = $1, spread_source = null
+          where entry_id = $2 and gw = $3`,
+        [team, eId, roundGw],
+      );
+      result = { ok: true };
+    });
+  } catch (e) {
+    // unique(entry_id, team_id) backstop against a concurrent write.
+    if (e && typeof e === "object" && "code" in e && (e as { code?: string }).code === "23505") {
+      return { ok: false, error: "That team is already used by this entry." };
+    }
+    return { ok: false, error: "Could not change your pick. Please try again." };
+  }
+
+  if (result.ok) revalidatePath("/lms");
+  return result;
 }
 
 // Set an entry's reserve strategy + confidence floor.
