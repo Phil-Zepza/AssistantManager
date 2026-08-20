@@ -49,6 +49,8 @@ import {
   createCompetition,
   addEntry,
   submitPick,
+  cancelPick,
+  changePick,
   setStrategy,
   setReserves,
   setRoundDeadline,
@@ -61,11 +63,13 @@ import {
 import { formatPct } from "@/lib/format";
 import { useSetTopbarDeadline } from "@/components/shell/TopbarDeadlineContext";
 import { deriveGwStatus, GW_STATUS_LABEL } from "@/lib/lmsStatus";
+import { pickLockLabel } from "@/lib/lmsPickGate";
 import type {
   LmsCompetitionDetail,
   LmsCompetitionSpreadView,
   LmsCompetitionSummary,
   LmsEntryDetail,
+  LmsEntryPickView,
   LmsGameweekFixture,
   LmsGwStatus,
   LmsReserveStrategy,
@@ -190,6 +194,20 @@ function findCompetitionDeadline(
   compId: number,
 ): { gw: number; deadline: string | null } | null {
   return competitions.find((c) => c.id === compId)?.nextDeadline ?? null;
+}
+
+// Human-friendly deadline label (e.g. "Sat, Aug 16, 06:30 PM"). Shared by the
+// submit/change confirm sheets so the "changeable until…" copy stays consistent.
+function formatDeadlineLabel(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "the deadline";
+  return d.toLocaleString(undefined, {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 // ─── Reserve-strategy copy (single source, reused across the add flows and the
@@ -399,6 +417,13 @@ export function LmsCanvas({
   const [confirmPick, setConfirmPick] = useState<RankedPick | null>(null);
   const [deadlineOpen, setDeadlineOpen] = useState(false);
   const [overrideGw, setOverrideGw] = useState<number | null>(null);
+  // Change/cancel a pending pick on an Open round. `changingPick` re-opens the
+  // team selectors (Top-3 + fixtures) so tapping a team routes through the
+  // change-confirm instead of the back-confirm; the two confirm sheets below own
+  // their own pending target.
+  const [changingPick, setChangingPick] = useState(false);
+  const [changeTarget, setChangeTarget] = useState<RankedPick | null>(null);
+  const [cancelConfirmOpen, setCancelConfirmOpen] = useState(false);
 
   // Reset per-entry state when competition changes
   useEffect(() => {
@@ -443,6 +468,7 @@ export function LmsCanvas({
       setFloorPct(Math.round(selectedEntry.detail.confidenceFloor * 100));
       setReserveIds([...selectedEntry.detail.reservedTeamIds]);
       setPins([]);
+      setChangingPick(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedEntry?.detail.id]);
@@ -706,13 +732,23 @@ export function LmsCanvas({
           nowMs,
         });
 
-  const alreadyLocked = !!selectedEntry?.detail.picks.some(
-    (p) => p.gw === currentGw,
-  );
+  const currentPick =
+    selectedEntry?.detail.picks.find((p) => p.gw === currentGw) ?? null;
+  const alreadyLocked = currentPick != null;
+  // A backed pick can be changed/cancelled only while the round is Open and the
+  // pick is still pending (auto-resolve hasn't settled it). This mirrors the
+  // server-enforced gate in canMutatePick — the server is the authority, this
+  // only decides whether to render the controls.
+  const pickIsPending = currentPick?.result === "pending";
+  const roundOpen = gwStatus === "open";
+  const canEditPick = alreadyLocked && pickIsPending && roundOpen;
   // Picks are writable while the round is open (before the deadline). "unknown"
   // (pre-mount / no fixture data) stays lenient so controls don't flash out.
+  // In `changingPick` mode we re-open the selectors over a backed pick so the
+  // user can choose a replacement (routed through the change-confirm).
   const canPick =
-    !alreadyLocked && (gwStatus === "open" || gwStatus === "unknown");
+    (!alreadyLocked || (changingPick && canEditPick)) &&
+    (gwStatus === "open" || gwStatus === "unknown");
 
   return (
     <div className="pb-24 md:pb-8">
@@ -743,6 +779,19 @@ export function LmsCanvas({
         />
       ) : (
         <>
+          {currentPick && (
+            <BackedPickCard
+              pick={currentPick}
+              currentGw={currentGw}
+              gwStatus={gwStatus}
+              canEdit={canEditPick}
+              changing={changingPick}
+              onChange={() => setChangingPick(true)}
+              onKeepCurrent={() => setChangingPick(false)}
+              onCancel={() => setCancelConfirmOpen(true)}
+            />
+          )}
+
           <Top3Section
             currentGw={currentGw}
             rankedPicks={rankedPicks}
@@ -750,7 +799,9 @@ export function LmsCanvas({
             canPick={canPick}
             spreadView={compDetail.spreadView}
             selectedEntryId={selectedEntryId}
-            onBackPick={(pick) => setConfirmPick(pick)}
+            onBackPick={(pick) =>
+              changingPick ? setChangeTarget(pick) : setConfirmPick(pick)
+            }
           />
 
           <FixturesSection
@@ -759,7 +810,9 @@ export function LmsCanvas({
             usedGwByTeamId={usedGwByTeamId}
             teamStatsById={teamStatsById}
             canPick={canPick}
-            onBackPick={(pick) => setConfirmPick(pick)}
+            onBackPick={(pick) =>
+              changingPick ? setChangeTarget(pick) : setConfirmPick(pick)
+            }
           />
 
           {plan && (
@@ -833,9 +886,36 @@ export function LmsCanvas({
         pick={confirmPick}
         currentGw={currentGw}
         entryId={selectedEntry?.detail.id ?? null}
+        deadline={nextDeadline?.deadline ?? null}
         onClose={() => setConfirmPick(null)}
         onSubmitted={() => {
           setConfirmPick(null);
+          router.refresh();
+        }}
+      />
+
+      <ChangeConfirmSheet
+        pick={changeTarget}
+        current={currentPick}
+        currentGw={currentGw}
+        entryId={selectedEntry?.detail.id ?? null}
+        onClose={() => setChangeTarget(null)}
+        onChanged={() => {
+          setChangeTarget(null);
+          setChangingPick(false);
+          router.refresh();
+        }}
+      />
+
+      <CancelConfirmSheet
+        open={cancelConfirmOpen}
+        pick={currentPick}
+        currentGw={currentGw}
+        entryId={selectedEntry?.detail.id ?? null}
+        onClose={() => setCancelConfirmOpen(false)}
+        onCancelled={() => {
+          setCancelConfirmOpen(false);
+          setChangingPick(false);
           router.refresh();
         }}
       />
@@ -3024,18 +3104,291 @@ function AddEntrySheet({
   );
 }
 
+// ─── Backed-pick card (current round) ─────────────────────────────────────────
+//
+// Shown when the current round already has a pick for this entry. While the
+// round is Open and the pick pending, it offers Change / Cancel (the selectors
+// re-open in `changing` mode). Otherwise the pick is locked — a status label,
+// no controls. Cancelling frees the team back to the available pool; changing
+// swaps it in place. The server re-checks the same gate before mutating.
+function BackedPickCard({
+  pick,
+  currentGw,
+  gwStatus,
+  canEdit,
+  changing,
+  onChange,
+  onKeepCurrent,
+  onCancel,
+}: {
+  pick: LmsEntryPickView;
+  currentGw: number | null;
+  gwStatus: LmsGwStatus;
+  canEdit: boolean;
+  changing: boolean;
+  onChange: () => void;
+  onKeepCurrent: () => void;
+  onCancel: () => void;
+}) {
+  const teamName = pick.team?.name ?? "Your pick";
+  const teamCode = pick.team?.short_name ?? null;
+
+  return (
+    <Card className="mb-4">
+      <div className="flex items-center gap-3">
+        <ClubBadge code={teamCode} size={44} state="recommended" />
+        <div className="min-w-0 flex-1">
+          <p className="text-xs font-semibold uppercase tracking-wider text-muted">
+            Your GW{currentGw ?? "?"} pick
+          </p>
+          <p className="truncate text-base font-bold text-primary">{teamName}</p>
+        </div>
+        {!canEdit && (
+          <Badge tone="gray" className="shrink-0">
+            <Lock className="mr-1 inline h-3 w-3" aria-hidden />
+            {pickLockLabel(gwStatus, pick.result)}
+          </Badge>
+        )}
+      </div>
+
+      {canEdit && (
+        <>
+          {changing ? (
+            <div className="mt-3 flex items-center justify-between gap-2">
+              <p className="text-xs text-secondary">
+                Choose a replacement from the teams below.
+              </p>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={onKeepCurrent}
+                className="shrink-0"
+              >
+                Keep current
+              </Button>
+            </div>
+          ) : (
+            <div className="mt-3 flex gap-2">
+              <Button
+                variant="secondary"
+                size="sm"
+                icon={<Pencil className="h-4 w-4" />}
+                onClick={onChange}
+              >
+                Change pick
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                icon={<Ban className="h-4 w-4" />}
+                onClick={onCancel}
+                className="text-danger hover:text-danger"
+              >
+                Cancel pick
+              </Button>
+            </div>
+          )}
+        </>
+      )}
+    </Card>
+  );
+}
+
+// ─── Sheet: Change pick confirm ───────────────────────────────────────────────
+
+function ChangeConfirmSheet({
+  pick,
+  current,
+  currentGw,
+  entryId,
+  onClose,
+  onChanged,
+}: {
+  pick: RankedPick | null;
+  current: LmsEntryPickView | null;
+  currentGw: number | null;
+  entryId: number | null;
+  onClose: () => void;
+  onChanged: () => void;
+}) {
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function handleConfirm() {
+    if (!pick || currentGw == null || entryId == null) return;
+    setError(null);
+    setSaving(true);
+    try {
+      const res = await changePick(entryId, currentGw, pick.team.fpl_id);
+      if (res.ok) {
+        onChanged();
+      } else {
+        setError(res.error ?? "Could not change your pick.");
+      }
+    } catch {
+      setError("Could not change your pick. Please try again.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const fromName = current?.team?.name ?? "your current pick";
+  const toName = pick?.team.name ?? "";
+
+  return (
+    <BottomSheet
+      open={pick != null}
+      onClose={() => {
+        setError(null);
+        onClose();
+      }}
+      title={`Replace your GW${currentGw ?? "?"} pick?`}
+    >
+      {pick ? (
+        <div className="space-y-4">
+          <div className="flex items-center justify-center gap-3">
+            <div className="flex flex-col items-center gap-1 opacity-70">
+              <ClubBadge code={current?.team?.short_name ?? null} size={44} state="used" />
+              <span className="text-xs text-secondary">{fromName}</span>
+            </div>
+            <ChevronRight className="h-5 w-5 text-muted" aria-hidden />
+            <div className="flex flex-col items-center gap-1">
+              <ClubBadge code={pick.team.short_name} size={44} state="recommended" />
+              <span className="text-xs font-semibold text-primary">{toName}</span>
+            </div>
+          </div>
+
+          <ProbBar home={pick.pWin} draw={pick.pDraw} away={pick.pLoss} showLabels />
+
+          <Callout tone="danger" title="Draw = OUT">
+            {toName} must win outright — a draw eliminates you just like a loss.
+          </Callout>
+
+          {error && <p className="text-sm text-danger">{error}</p>}
+
+          <div className="flex gap-2">
+            <Button onClick={handleConfirm} disabled={saving} fullWidth>
+              {saving ? "Changing…" : "Confirm change"}
+            </Button>
+            <Button
+              variant="ghost"
+              onClick={() => {
+                setError(null);
+                onClose();
+              }}
+              disabled={saving}
+            >
+              Cancel
+            </Button>
+          </div>
+        </div>
+      ) : (
+        <p className="text-sm text-secondary">No replacement selected.</p>
+      )}
+    </BottomSheet>
+  );
+}
+
+// ─── Sheet: Cancel pick confirm ───────────────────────────────────────────────
+
+function CancelConfirmSheet({
+  open,
+  pick,
+  currentGw,
+  entryId,
+  onClose,
+  onCancelled,
+}: {
+  open: boolean;
+  pick: LmsEntryPickView | null;
+  currentGw: number | null;
+  entryId: number | null;
+  onClose: () => void;
+  onCancelled: () => void;
+}) {
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function handleConfirm() {
+    if (currentGw == null || entryId == null) return;
+    setError(null);
+    setSaving(true);
+    try {
+      const res = await cancelPick(entryId, currentGw);
+      if (res.ok) {
+        onCancelled();
+      } else {
+        setError(res.error ?? "Could not cancel your pick.");
+      }
+    } catch {
+      setError("Could not cancel your pick. Please try again.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const teamName = pick?.team?.name ?? "This team";
+
+  return (
+    <BottomSheet
+      open={open}
+      onClose={() => {
+        setError(null);
+        onClose();
+      }}
+      title={`Cancel your GW${currentGw ?? "?"} pick?`}
+    >
+      <div className="space-y-4">
+        <div className="flex items-center gap-3">
+          <ClubBadge code={pick?.team?.short_name ?? null} size={44} state="used" />
+          <p className="text-sm text-secondary">
+            <span className="font-semibold text-primary">{teamName}</span>{" "}
+            returns to your available pool. You can back a different team while the
+            round is still open.
+          </p>
+        </div>
+
+        {error && <p className="text-sm text-danger">{error}</p>}
+
+        <div className="flex gap-2">
+          <Button
+            variant="danger"
+            onClick={handleConfirm}
+            disabled={saving}
+            fullWidth
+          >
+            {saving ? "Cancelling…" : "Cancel pick"}
+          </Button>
+          <Button
+            variant="ghost"
+            onClick={() => {
+              setError(null);
+              onClose();
+            }}
+            disabled={saving}
+          >
+            Keep pick
+          </Button>
+        </div>
+      </div>
+    </BottomSheet>
+  );
+}
+
 // ─── Sheet: Submit confirm ────────────────────────────────────────────────────
 
 function SubmitConfirmSheet({
   pick,
   currentGw,
   entryId,
+  deadline,
   onClose,
   onSubmitted,
 }: {
   pick: RankedPick | null;
   currentGw: number | null;
   entryId: number | null;
+  deadline: string | null;
   onClose: () => void;
   onSubmitted: () => void;
 }) {
@@ -3091,9 +3444,10 @@ function SubmitConfirmSheet({
 
           {/* Draw = OUT — THE only place this rule appears */}
           <Callout tone="danger" title="Draw = OUT">
-            A draw eliminates you just like a loss. Your team must win
-            outright. This pick locks GW{currentGw ?? "?"} and cannot be
-            changed.
+            A draw eliminates you just like a loss — your team must win
+            outright. You can change this pick until the deadline
+            {deadline ? ` (${formatDeadlineLabel(deadline)})` : ""}; it locks
+            when GW{currentGw ?? "?"} starts.
           </Callout>
 
           {error && <p className="text-sm text-danger">{error}</p>}
