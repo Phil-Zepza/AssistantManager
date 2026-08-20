@@ -476,17 +476,18 @@ export interface PlayerStatLine {
   xg: number | null; // expected goals for the season shown
 }
 
-// Which season the scouting numbers reflect (drives the "last season" label).
-export type ScoutingSeason = "current" | "last" | "none";
+// Which season the scouting numbers reflect. Current-season only: "current"
+// once games are played, else "none" (pending) — no last-season fallback.
+export type ScoutingSeason = "current" | "none";
 
 // Per-team scouting glance shown on pick cards and expanded fixture rows:
-// recent form (W/D/L), top scorers and team xG. Current-season data is
-// preferred, falling back to the most recent past season until games are
-// played (see player_season_stats / db/migrations/002_player_season_stats.sql).
+// recent form (W/D/L), top scorers and team xG. Current-season data only; before
+// this season's games are played the UI shows a pending state rather than
+// last-season numbers (see player_season_stats / db/migrations/002_player_season_stats.sql).
 export interface TeamScouting {
   teamId: number;
   season: ScoutingSeason;
-  seasonLabel: string | null; // e.g. "2025/26" when season === "last"
+  seasonLabel: string | null; // e.g. "2025/26" when season === "current"
   form: ("W" | "D" | "L")[]; // last ≤5 finished results, oldest → newest
   topScorers: PlayerStatLine[]; // up to 3, by goals desc
   goalsFor: number | null; // team goals in the season shown
