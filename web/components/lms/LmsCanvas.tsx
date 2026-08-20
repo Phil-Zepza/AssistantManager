@@ -58,6 +58,7 @@ import {
   unskipRound,
 } from "@/app/actions";
 import { formatPct } from "@/lib/format";
+import { useSetTopbarDeadline } from "@/components/shell/TopbarDeadlineContext";
 import { deriveGwStatus, GW_STATUS_LABEL } from "@/lib/lmsStatus";
 import type {
   LmsCompetitionDetail,
@@ -267,12 +268,13 @@ function ScoutingDetail({
     );
   }
 
-  // No current-season minutes yet (season === "last" or "none") — show a clear
-  // pending state rather than displaying last-season numbers without context.
+  // No current-season data yet — show a clear pending state. We deliberately do
+  // NOT fall back to last-season numbers (see getTeamScouting): stats auto-fill
+  // once this season's games have been played.
   if (scouting.season !== "current") {
     return (
       <p className="text-[11px] text-muted">
-        No current-season data yet — check back after kickoff.
+        No current-season data yet — stats appear once games are played.
       </p>
     );
   }
@@ -618,6 +620,19 @@ export function LmsCanvas({
     setPins((prev) => prev.filter((p) => p.gw !== gw));
   }
 
+  // Publish this competition's effective round deadline (override else default)
+  // to the top app bar so its countdown matches the status header below. Cleared
+  // (→ layout default) whenever no competition is open. Called unconditionally,
+  // before the lobby early-return, to respect the Rules of Hooks.
+  const topbarDeadline = compDetail
+    ? findCompetitionDeadline(competitions, compDetail.competition.id)
+    : null;
+  useSetTopbarDeadline(
+    topbarDeadline?.deadline ?? null,
+    topbarDeadline?.gw ?? null,
+    compDetail != null,
+  );
+
   // ── Lobby ──────────────────────────────────────────────────────────────────
 
   if (!compDetail) {
@@ -822,6 +837,9 @@ export function LmsCanvas({
           skipSaving={skipSaving}
           onSkip={handleSkipRound}
           onUnskip={handleUnskipRound}
+          spreadActive={
+            spreadMode !== "off" && planInputs.aliveEntries.length >= 2
+          }
         />
       )}
     </div>
@@ -2031,7 +2049,12 @@ function PlanTile({
       )}
 
       {isPinnedFlag && (
-        <span className="mt-1 block text-[10px] text-accent">Tap to clear</span>
+        <>
+          <span className="mt-1 inline-block rounded border border-accent px-1.5 py-0.5 text-[10px] font-semibold text-accent">
+            Manual override
+          </span>
+          <span className="mt-1 block text-[10px] text-muted">Tap to clear</span>
+        </>
       )}
 
       {/* Spread source markers */}
@@ -3157,6 +3180,7 @@ function PinPickerSheet({
   skipSaving,
   onSkip,
   onUnskip,
+  spreadActive,
 }: {
   gw: number | null;
   onClose: () => void;
@@ -3169,6 +3193,8 @@ function PinPickerSheet({
   skipSaving: boolean;
   onSkip: (gw: number, reason?: string) => void;
   onUnskip: (gw: number) => void;
+  /** Spread is coordinating this competition (soft/strong + ≥2 alive entries). */
+  spreadActive: boolean;
 }) {
   const teamMap = useMemo(
     () => new Map(teams.map((t) => [t.id, t])),
@@ -3318,6 +3344,12 @@ function PinPickerSheet({
       ) : (
         // ── Normal round: pick-override list + quiet "Skip this round" ────────
         <div className="space-y-2">
+          {spreadActive && (
+            <Callout tone="warning">
+              Overriding takes this round out of the coordinated spread for this
+              entry — your other entries keep coordinating around your pick.
+            </Callout>
+          )}
           <p className="text-xs text-muted">
             Choose a team for GW{gw}. This overrides the plan in your browser
             only — nothing is saved until you submit the actual pick.

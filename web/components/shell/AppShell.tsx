@@ -14,6 +14,10 @@ import {
 } from "lucide-react";
 import { Badge, Countdown } from "@/components/ui";
 import { signOutAction } from "@/app/actions";
+import {
+  TopbarDeadlineProvider,
+  useTopbarDeadlineOverride,
+} from "@/components/shell/TopbarDeadlineContext";
 import { cn } from "@/lib/cn";
 
 interface NavItem {
@@ -55,7 +59,15 @@ export interface AppShellProps {
   deadline?: string | null;
 }
 
-export function AppShell({ children, userEmail, gw, deadline }: AppShellProps) {
+export function AppShell(props: AppShellProps) {
+  return (
+    <TopbarDeadlineProvider>
+      <AppShellInner {...props} />
+    </TopbarDeadlineProvider>
+  );
+}
+
+function AppShellInner({ children, userEmail, gw, deadline }: AppShellProps) {
   const pathname = usePathname();
   const title = contextualTitle(pathname);
 
@@ -109,8 +121,7 @@ export function AppShell({ children, userEmail, gw, deadline }: AppShellProps) {
               {title}
             </h1>
             <div className="ml-auto flex items-center gap-2.5">
-              {gw != null && <Badge tone="accent">GW {gw}</Badge>}
-              <Countdown deadline={deadline} className="text-sm" />
+              <TopbarDeadline fallbackGw={gw ?? null} fallbackDeadline={deadline ?? null} />
               <div className="md:hidden">
                 <AvatarMenu email={userEmail} placement="down" />
               </div>
@@ -136,6 +147,28 @@ export function AppShell({ children, userEmail, gw, deadline }: AppShellProps) {
         </div>
       </nav>
     </div>
+  );
+}
+
+// Top-bar GW badge + countdown. Reads the competition screen's published
+// deadline override when present, so the bar and the competition status header
+// always count down to the same effective round deadline; falls back to the
+// layout's generic next-LMS-round deadline everywhere else.
+function TopbarDeadline({
+  fallbackGw,
+  fallbackDeadline,
+}: {
+  fallbackGw: number | null;
+  fallbackDeadline: string | null;
+}) {
+  const override = useTopbarDeadlineOverride();
+  const gw = override ? override.gw : fallbackGw;
+  const deadline = override ? override.deadline : fallbackDeadline;
+  return (
+    <>
+      {gw != null && <Badge tone="accent">GW {gw}</Badge>}
+      <Countdown deadline={deadline} className="text-sm" />
+    </>
   );
 }
 

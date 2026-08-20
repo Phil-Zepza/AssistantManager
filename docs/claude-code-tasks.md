@@ -133,3 +133,32 @@ Status: QUEUED (after a squad can be loaded). Best XI from the 15 (valid formati
 projections; captain/vice; best single transfer weighing the −4 hit (budget = bank + sell value,
 sell ≈ current price for now); write fpl_xi / fpl_captain / fpl_transfer to recommendations_log;
 surface on the dashboard. Handle empty-squad (pre-deadline) gracefully.
+
+---
+
+## CC-LMS-pass1b — LMS competition screen: three pass-1 review fixes  (Model: Opus)
+Status: IN REVIEW — branch `fix/lms-pass1-bugs`, PR into `staging` (do not merge).
+
+Scope (fixes on top of the LMS rework + skip-rounds UI already on `staging`):
+1. **Duplicate countdowns disagreed.** Root cause: the top app bar counted down to a *generic*
+   next-LMS-round deadline (`getNextLmsDeadline` → `computeDefaultDeadline`), which ignores a
+   competition's `setRoundDeadline` override and its skipped-round shifts, while the competition
+   status header used the competition's effective `nextDeadline` (override-aware). Fix: new
+   `TopbarDeadlineContext` — the competition screen publishes its effective `{gw, deadline}` to the
+   top bar via `useSetTopbarDeadline`, so both read one value; cleared to the layout default when no
+   competition is open.
+2. **Expanded fixture showed last-season stats.** The view already rendered a pending state for
+   non-current data, but `getTeamScouting` still *fetched* and returned the last-season fallback.
+   Removed the fetch/fallback (query is now `is_current = true` only; `season` collapses to
+   `current | none`), and updated the empty-state copy. **Deliberate reversal** of the earlier
+   labelled-last-season decision.
+3. **Forward-plan override sheet.** Inspection: the sheet already uses the shared `BottomSheet`
+   (backdrop/Esc/Cancel all wired — 3a already sound on `staging`), and `computeCompetitionPlan`
+   already honours a per-entry pin under spread (excludes the pinned entry from the joint pool,
+   pre-assigns its team, tags `manualOverride`/`spreadSource=null`) with the UI passing the override
+   in as a pin — so 3b is functional. Added the still-missing pieces: a warning-tone `Callout` before
+   the pick list when spread is active (soft/strong + ≥2 entries), an explicit "Manual override" tile
+   chip, and a spread test proving a per-entry pin survives the joint pass while siblings coordinate
+   around it. Skip / Restore controls preserved.
+
+Verify: `npx tsc --noEmit` (0), `npm test` (51 passing, +2 new), `npm run build` (exit 0).

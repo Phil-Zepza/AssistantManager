@@ -1171,8 +1171,9 @@ export async function getCompetitionSpreadView(
 }
 
 // Per-team scouting glance (recent form + top scorers + team xG) for the LMS
-// detail block. Prefers current-season stats, falling back to the most recent
-// past season (season === "last") until games are played. Reference/model data
+// detail block. Current-season stats ONLY: before this season's games are
+// played the block shows a pending state — no last-season fallback (a deliberate
+// reversal of the earlier labelled-last-season behaviour). Reference/model data
 // — open to any signed-in user (no per-user rows). Empty input -> empty result.
 export async function getTeamScouting(
   teamIds: number[],
@@ -1197,11 +1198,14 @@ export async function getTeamScouting(
     // degrade the scouting block to form-only rather than 500 the whole detail
     // page — recent form below comes from `fixtures`, which always exists.
     q<StatRow>(
+      // Current-season rows ONLY. We no longer fetch past seasons: the LMS
+      // detail shows current-season stats or a pending state, never a
+      // last-season fallback (see ScoutingDetail).
       `select p.team_id, p.web_name, s.season, s.is_current,
               s.minutes, s.goals, s.xg
          from players p
          join player_season_stats s on s.player_id = p.fpl_id
-        where p.team_id = any($1::int[])`,
+        where p.team_id = any($1::int[]) and s.is_current = true`,
       [ids],
     ).catch((err: unknown): StatRow[] => {
       const code = (err as { code?: string } | null)?.code;
@@ -1249,25 +1253,12 @@ export async function getTeamScouting(
     if (r.away_team != null && formByTeam.has(r.away_team)) push(r.away_team, awayRes);
   }
 
-  // Group season stat rows by team, split current vs. most-recent past season.
-  interface TeamRows {
-    current: typeof statRows;
-    pastBySeason: Map<string, typeof statRows>;
-  }
-  const byTeam = new Map<number, TeamRows>();
+  // Group the (current-season only) stat rows by team.
+  const byTeam = new Map<number, typeof statRows>();
   for (const r of statRows) {
-    let t = byTeam.get(r.team_id);
-    if (!t) {
-      t = { current: [], pastBySeason: new Map() };
-      byTeam.set(r.team_id, t);
-    }
-    if (r.is_current) {
-      t.current.push(r);
-    } else {
-      const list = t.pastBySeason.get(r.season) ?? [];
-      list.push(r);
-      t.pastBySeason.set(r.season, list);
-    }
+    const list = byTeam.get(r.team_id) ?? [];
+    list.push(r);
+    byTeam.set(r.team_id, list);
   }
 
   const sum = (rows: typeof statRows, key: "goals" | "xg"): number =>
@@ -1281,53 +1272,25 @@ export async function getTeamScouting(
       .map((r) => ({ name: r.web_name, goals: r.goals ?? 0, xg: r.xg }));
 
   return ids.map((teamId): TeamScouting => {
-    const t = byTeam.get(teamId);
+    const rows = byTeam.get(teamId) ?? [];
     const form = formByTeam.get(teamId) ?? [];
     const form5 = form.slice(-5);
 
-    if (!t) {
-      return {
-        teamId,
-        season: "none",
-        seasonLabel: null,
-        form: form5,
-        topScorers: [],
-        goalsFor: null,
-        xgFor: null,
-      };
-    }
-
-    // Prefer current-season data once any minutes have been played this season.
-    const currentMinutes = t.current.reduce((a, r) => a + (r.minutes ?? 0), 0);
-
-    let season: ScoutingSeason;
-    let seasonLabel: string | null;
-    let rows: typeof statRows;
-
-    if (currentMinutes > 0) {
-      season = "current";
-      seasonLabel = t.current[0]?.season ?? null;
-      rows = t.current;
-    } else if (t.pastBySeason.size > 0) {
-      // most recent past season by label (season strings sort chronologically)
-      const latest = [...t.pastBySeason.keys()].sort().at(-1)!;
-      season = "last";
-      seasonLabel = latest;
-      rows = t.pastBySeason.get(latest)!;
-    } else {
-      season = "none";
-      seasonLabel = null;
-      rows = [];
-    }
+    // Current-season only: "current" once any minutes have been played this
+    // season, otherwise "none" → the UI shows a pending state. No last-season
+    // fallback.
+    const currentMinutes = rows.reduce((a, r) => a + (r.minutes ?? 0), 0);
+    const hasCurrent = currentMinutes > 0;
+    const season: ScoutingSeason = hasCurrent ? "current" : "none";
 
     return {
       teamId,
       season,
-      seasonLabel,
+      seasonLabel: hasCurrent ? rows[0]?.season ?? null : null,
       form: form5,
-      topScorers: topScorers(rows),
-      goalsFor: rows.length > 0 ? sum(rows, "goals") : null,
-      xgFor: rows.length > 0 ? Math.round(sum(rows, "xg") * 10) / 10 : null,
+      topScorers: hasCurrent ? topScorers(rows) : [],
+      goalsFor: hasCurrent ? sum(rows, "goals") : null,
+      xgFor: hasCurrent ? Math.round(sum(rows, "xg") * 10) / 10 : null,
     };
   });
 }

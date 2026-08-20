@@ -286,6 +286,75 @@ describe("computeCompetitionPlan — overrides & tagging", () => {
   });
 });
 
+describe("computeCompetitionPlan — per-entry manual pin (override under spread)", () => {
+  // gw1: A(1) 0.80, B(2) 0.72, C(3) 0.68 — all clear the 0.65 floor.
+  const fixtureProbs = [
+    prob(1, 1, 7, 0.8, 0.05), // A
+    prob(1, 2, 8, 0.72, 0.08), // B
+    prob(1, 3, 6, 0.68, 0.12), // C
+  ];
+
+  it("honours the pinned team for that entry and lets siblings coordinate around it (Soft)", () => {
+    // Baseline (no pin): Soft hands e1 its safest A(1), e2 the distinct B(2).
+    const baseline = computeCompetitionPlan(
+      compInput({ spreadMode: "soft", entries: [entry(1), entry(2)], fixtureProbs }),
+    );
+    expect(pickOf(baseline, 1, 1).teamId).toBe(1);
+    expect(pickOf(baseline, 2, 1).teamId).toBe(2);
+
+    // Now e1 pins C(3) — NOT its natural safest — while spread stays on.
+    const plan = computeCompetitionPlan(
+      compInput({
+        spreadMode: "soft",
+        entries: [
+          { ...entry(1), pins: [{ gw: 1, teamId: 3 }] },
+          entry(2),
+        ],
+        fixtureProbs,
+      }),
+    );
+
+    const pinned = pickOf(plan, 1, 1);
+    expect(pinned.teamId).toBe(3); // the joint pass did NOT overwrite the pin
+    expect(pinned.manualOverride).toBe(true); // tagged distinctly for the UI
+    expect(pinned.spreadSource).toBeNull(); // not Matched / Spread
+    expect(pinned.flags).toContain("pinned");
+
+    // The sibling keeps coordinating: it steps around the pinned team, is not
+    // handed C(3), and is free to take the now-available safest A(1).
+    const sibling = pickOf(plan, 2, 1);
+    expect(sibling.teamId).not.toBe(3);
+    expect(sibling.teamId).toBe(1);
+    expect(sibling.manualOverride).toBeFalsy();
+    // Pin + sibling remain distinct teams — spread coordination preserved.
+    expect(new Set([pinned.teamId, sibling.teamId]).size).toBe(2);
+  });
+
+  it("pins under Strong too, with siblings still allocated distinct sides", () => {
+    const plan = computeCompetitionPlan(
+      compInput({
+        spreadMode: "strong",
+        entries: [
+          { ...entry(1), pins: [{ gw: 1, teamId: 3 }] },
+          entry(2),
+          entry(3),
+        ],
+        fixtureProbs,
+      }),
+    );
+    const p1 = pickOf(plan, 1, 1);
+    expect(p1.teamId).toBe(3);
+    expect(p1.manualOverride).toBe(true);
+    const p2 = pickOf(plan, 2, 1);
+    const p3 = pickOf(plan, 3, 1);
+    // Three entries, three distinct teams — the pin took one out of the pool and
+    // the other two coordinated around it.
+    expect(new Set([p1.teamId, p2.teamId, p3.teamId]).size).toBe(3);
+    expect(p2.teamId).not.toBe(3);
+    expect(p3.teamId).not.toBe(3);
+  });
+});
+
 describe("computeCompetitionPlan — Off reproduces PR A", () => {
   it("off mode reproduces per-entry computeForwardPlan exactly (incl. smart), no tagging", () => {
     const upcomingRounds = [round(1), round(2), round(3)];
