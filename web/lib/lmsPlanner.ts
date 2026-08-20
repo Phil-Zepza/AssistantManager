@@ -12,7 +12,7 @@ export type ReserveStrategy = "safest" | "manual" | "smart";
 
 // Flag vocabulary carried on PlannedPick.flags.
 export type PlanFlag =
-  | "skipped" // sub-7 round: no team spent
+  | "skipped" // round skipped (auto threshold OR manual): no team spent. See PlannedPick.skipKind.
   | "needsDeploy" // best available (non-reserved) pick is below the confidence floor
   | "reserveDeployed" // a held elite reserve was deployed this round (smart)
   | "eliteEarly" // an elite was spent while a non-elite >= floor was also available
@@ -32,9 +32,93 @@ export interface PlannerEntryState {
 
 export interface PlannerRound {
   gw: number;
-  /** gameweeks.lms_eligible (num_fixtures >= 7). Sub-7 rounds are skipped. */
+  /**
+   * gameweeks.lms_eligible (num_fixtures >= 7). Informational only — kept because
+   * the read layer still selects it and cosmetic callers use it, but NO LONGER the
+   * skip gate. Skip status is decided per-competition by roundSkipStatus() below,
+   * against numFixtures + the competition's threshold and manual skips.
+   */
   lmsEligible: boolean;
   numFixtures: number | null;
+}
+
+/**
+ * Per-competition skip configuration. Both fields come from lms_competitions /
+ * lms_competition_skipped_rounds via the read layer (lib/queries.ts).
+ */
+export interface PlannerCompetition {
+  /**
+   * competition.auto_skip_under_fixtures. Rounds with fewer than this many PL
+   * fixtures are auto-skipped. null = no fixture-count rule for this competition.
+   */
+  autoSkipUnderFixtures: number | null;
+  /** competition.lms_competition_skipped_rounds — manually-skipped rounds. */
+  skippedRounds: ReadonlyArray<{ gw: number; reason: string | null }>;
+}
+
+/**
+ * The discriminated skip result the forward-plan tiles render directly. `kind`
+ * tells auto (fixture-count threshold) from manual (user skip) — a purely
+ * PRESENTATIONAL distinction: both drop the round from allocation identically.
+ * `reason` is a display-ready string in both cases.
+ */
+export type RoundSkipStatus =
+  | { skipped: false }
+  | { skipped: true; kind: "auto" | "manual"; reason: string };
+
+/** Default when a caller supplies no competition: today's global "sub-7" rule. */
+const DEFAULT_COMPETITION: PlannerCompetition = {
+  autoSkipUnderFixtures: 7,
+  skippedRounds: [],
+};
+
+/**
+ * The single source of truth for "is this round skipped, and why". Both allocators
+ * (computeForwardPlan and computeCompetitionPlan) route through here so they can
+ * never diverge. Pure + side-effect free.
+ *
+ * Manual skips take precedence over the auto rule (an explicit user action, and it
+ * carries the user's reason). A null/blank numFixtures is treated as below any
+ * threshold, matching the pre-migration behaviour where such rounds were skipped.
+ */
+export function roundSkipStatus(
+  round: PlannerRound,
+  competition: PlannerCompetition,
+): RoundSkipStatus {
+  const manual = competition.skippedRounds.find((s) => s.gw === round.gw);
+  if (manual) {
+    const reason = manual.reason?.trim();
+    return {
+      skipped: true,
+      kind: "manual",
+      reason: reason && reason.length > 0 ? reason : "manually skipped — does not count for LMS",
+    };
+  }
+  const threshold = competition.autoSkipUnderFixtures;
+  if (threshold != null && (round.numFixtures ?? 0) < threshold) {
+    return {
+      skipped: true,
+      kind: "auto",
+      reason: `under ${threshold} fixtures — does not count for LMS`,
+    };
+  }
+  return { skipped: false };
+}
+
+/** Boolean convenience over roundSkipStatus. */
+export function isRoundSkipped(
+  round: PlannerRound,
+  competition: PlannerCompetition,
+): boolean {
+  return roundSkipStatus(round, competition).skipped;
+}
+
+/** The rounds that count for this competition (skipped rounds removed). */
+export function qualifyingRounds(
+  rounds: ReadonlyArray<PlannerRound>,
+  competition: PlannerCompetition,
+): PlannerRound[] {
+  return rounds.filter((r) => !isRoundSkipped(r, competition));
 }
 
 export interface PlannerFixtureProb {
@@ -66,6 +150,12 @@ export interface PlannedPick {
   pWin: number | null;
   reason: string;
   flags: PlanFlag[];
+  /**
+   * Only set on a skipped pick (flags includes "skipped"): why the round was
+   * skipped — "auto" (fixture-count threshold) or "manual" (user skip). The tile
+   * uses this to tell the two apart; `reason` carries the display text for both.
+   */
+  skipKind?: "auto" | "manual";
 }
 
 export interface PlannedReserve {
@@ -90,6 +180,11 @@ export interface ComputeForwardPlanInput {
   eliteSet: number[];
   /** Provisional future-round overrides. In-memory only; never persisted. */
   pins?: PlannerPin[];
+  /**
+   * Per-competition skip config (threshold + manual skips). Omitted -> today's
+   * global "sub-7 fixtures" rule (DEFAULT_COMPETITION).
+   */
+  competition?: PlannerCompetition;
 }
 
 interface TeamWin {
@@ -148,6 +243,7 @@ export function computeForwardPlan(input: ComputeForwardPlanInput): ForwardPlan 
   const floor = entryState.confidenceFloor;
   const strategy = entryState.strategy;
   const pins = input.pins ?? [];
+  const competition = input.competition ?? DEFAULT_COMPETITION;
 
   const teamById = new Map<number, PlannerTeam>();
   for (const t of teams) teamById.set(t.id, t);
@@ -214,7 +310,8 @@ export function computeForwardPlan(input: ComputeForwardPlanInput): ForwardPlan 
     for (const r of rounds) {
       const teamId = pinByGw.get(r.gw);
       if (teamId == null) continue;
-      const plays = r.lmsEligible && (winByGw.get(r.gw)?.has(teamId) ?? false);
+      const plays =
+        !isRoundSkipped(r, competition) && (winByGw.get(r.gw)?.has(teamId) ?? false);
       if (plays && !provisional.has(teamId)) {
         validPins.set(r.gw, teamId);
         provisional.add(teamId);
@@ -232,12 +329,16 @@ export function computeForwardPlan(input: ComputeForwardPlanInput): ForwardPlan 
   const picks: PlannedPick[] = [];
   const reserves: PlannedReserve[] = [];
 
-  const skippedPick = (r: PlannerRound): PlannedPick => ({
+  const skippedPick = (
+    r: PlannerRound,
+    skip: Extract<RoundSkipStatus, { skipped: true }>,
+  ): PlannedPick => ({
     gw: r.gw,
     teamId: null,
     pWin: null,
-    reason: "under 7 fixtures — does not count for LMS",
+    reason: skip.reason,
     flags: ["skipped"],
+    skipKind: skip.kind,
   });
 
   const emitPin = (gw: number): void => {
@@ -289,8 +390,9 @@ export function computeForwardPlan(input: ComputeForwardPlanInput): ForwardPlan 
     }
 
     for (const r of rounds) {
-      if (!r.lmsEligible) {
-        picks.push(skippedPick(r));
+      const skip = roundSkipStatus(r, competition);
+      if (skip.skipped) {
+        picks.push(skippedPick(r, skip));
         continue;
       }
       if (validPins.has(r.gw)) {
@@ -341,7 +443,7 @@ export function computeForwardPlan(input: ComputeForwardPlanInput): ForwardPlan 
   }
 
   // -------------------- smart (two-pass) --------------------
-  const eligibleGws = rounds.filter((r) => r.lmsEligible).map((r) => r.gw);
+  const eligibleGws = qualifyingRounds(rounds, competition).map((r) => r.gw);
 
   // Held elites: eliteSet not already used/claimed, with >= 1 HOME fixture in an
   // eligible round of the horizon. Withheld from normal allocation.
@@ -363,7 +465,7 @@ export function computeForwardPlan(input: ComputeForwardPlanInput): ForwardPlan 
   // first, strongest available elite to the neediest round.
   const needy: Array<{ gw: number; weakness: number }> = [];
   for (const r of rounds) {
-    if (!r.lmsEligible || validPins.has(r.gw)) continue;
+    if (isRoundSkipped(r, competition) || validPins.has(r.gw)) continue;
     const nonElite = rank(
       r.gw,
       (id) => !allocated.has(id) && !heldElites.has(id) && !eliteSetIds.has(id),
@@ -387,8 +489,9 @@ export function computeForwardPlan(input: ComputeForwardPlanInput): ForwardPlan 
 
   // Pass 2 — final sweep in gw order.
   for (const r of rounds) {
-    if (!r.lmsEligible) {
-      picks.push(skippedPick(r));
+    const skip = roundSkipStatus(r, competition);
+    if (skip.skipped) {
+      picks.push(skippedPick(r, skip));
       continue;
     }
     if (validPins.has(r.gw)) {
@@ -529,6 +632,13 @@ export interface ComputeCompetitionPlanInput {
   /** Competition Soft floor (default 0.65). Used per entry when its own floor is not finite. */
   spreadFloorSoft: number;
   overrides?: SpreadOverride[];
+  /**
+   * Per-competition skip config (threshold + manual skips). Routed through the
+   * SAME roundSkipStatus() helper the per-entry engine uses, so the joint and
+   * per-entry allocators can never disagree on which rounds count. Omitted ->
+   * today's global "sub-7 fixtures" rule (DEFAULT_COMPETITION).
+   */
+  competition?: PlannerCompetition;
 }
 
 export interface SpreadPlannedPick extends PlannedPick {
@@ -555,6 +665,7 @@ export function computeCompetitionPlan(
   input: ComputeCompetitionPlanInput,
 ): CompetitionPlan {
   const { spreadMode, teams } = input;
+  const competition = input.competition ?? DEFAULT_COMPETITION;
 
   const teamById = new Map<number, PlannerTeam>();
   for (const t of teams) teamById.set(t.id, t);
@@ -623,6 +734,7 @@ export function computeCompetitionPlan(
         teams,
         eliteSet: input.eliteSet,
         pins: e.pins,
+        competition,
       }),
     );
   }
@@ -805,6 +917,7 @@ export function computeCompetitionPlan(
       pWin: null,
       reason: base?.reason ?? "under 7 fixtures — does not count for LMS",
       flags: base?.flags ?? (["skipped"] as PlanFlag[]),
+      skipKind: base?.skipKind,
       entryId,
       spreadSource: null,
     });
@@ -813,7 +926,7 @@ export function computeCompetitionPlan(
   const autoCollapsedGws: number[] = [];
 
   for (const r of rounds) {
-    if (!r.lmsEligible) {
+    if (isRoundSkipped(r, competition)) {
       for (const e of entries) skippedSpread(e.entryId, r.gw);
       continue;
     }

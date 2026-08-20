@@ -13,6 +13,7 @@ import {
   type CompetitionPlan,
   type SpreadMode,
   type SpreadOverride,
+  type PlannerCompetition,
 } from "./lmsPlanner";
 
 // ---------- builders (mirrors lmsPlanner.test.ts) ----------
@@ -34,7 +35,11 @@ const TEAMS: PlannerTeam[] = [
 ];
 const ELITE = computeEliteSet(TEAMS, 4);
 
-function round(gw: number, lmsEligible = true, numFixtures = 10): PlannerRound {
+function round(
+  gw: number,
+  lmsEligible = true,
+  numFixtures = lmsEligible ? 10 : 5,
+): PlannerRound {
   return { gw, lmsEligible, numFixtures };
 }
 
@@ -82,6 +87,7 @@ function compInput(
     spreadMode: SpreadMode;
     spreadFloorSoft?: number;
     overrides?: SpreadOverride[];
+    competition?: PlannerCompetition;
   },
 ): ComputeCompetitionPlanInput {
   return {
@@ -93,6 +99,7 @@ function compInput(
     spreadMode: o.spreadMode,
     spreadFloorSoft: o.spreadFloorSoft ?? 0.65,
     overrides: o.overrides ?? [],
+    competition: o.competition,
   };
 }
 
@@ -347,6 +354,42 @@ describe("computeCompetitionPlan — sub-7 rounds", () => {
     // Round 2 still allocates distinct teams.
     expect(pickOf(plan, 1, 2).teamId).toBe(1);
     expect(pickOf(plan, 2, 2).teamId).toBe(2);
+  });
+
+  it("routes per-competition skips through the shared helper for every entry", () => {
+    const skipComp: PlannerCompetition = {
+      autoSkipUnderFixtures: 7,
+      skippedRounds: [{ gw: 2, reason: "organiser off week" }],
+    };
+    const plan = computeCompetitionPlan(
+      compInput({
+        spreadMode: "soft",
+        entries: [entry(1), entry(2)],
+        // gw1: qualifies (10). gw2: manually skipped. gw3: auto-skipped (sub-7).
+        upcomingRounds: [round(1, true, 10), round(2, true, 10), round(3, false, 5)],
+        fixtureProbs: [
+          prob(1, 1, 7, 0.8, 0.05),
+          prob(1, 2, 8, 0.72, 0.08),
+          prob(2, 1, 7, 0.9, 0.05),
+          prob(3, 1, 7, 0.9, 0.05),
+        ],
+        competition: skipComp,
+      }),
+    );
+    for (const eid of [1, 2]) {
+      const manual = pickOf(plan, eid, 2);
+      expect(manual.teamId).toBeNull();
+      expect(manual.flags).toContain("skipped");
+      expect(manual.skipKind).toBe("manual");
+      expect(manual.reason).toBe("organiser off week");
+
+      const auto = pickOf(plan, eid, 3);
+      expect(auto.teamId).toBeNull();
+      expect(auto.skipKind).toBe("auto");
+    }
+    // gw1 still allocates distinct teams across the two entries.
+    expect(pickOf(plan, 1, 1).teamId).toBe(1);
+    expect(pickOf(plan, 2, 1).teamId).toBe(2);
   });
 });
 
