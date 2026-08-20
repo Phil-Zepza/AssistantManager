@@ -162,3 +162,30 @@ Scope (fixes on top of the LMS rework + skip-rounds UI already on `staging`):
    around it. Skip / Restore controls preserved.
 
 Verify: `npx tsc --noEmit` (0), `npm test` (51 passing, +2 new), `npm run build` (exit 0).
+
+---
+
+## CC-LMS-pass1c — LMS competition screen: picks-above-fixtures + backable-either-side  (Model: Opus)
+Status: IN REVIEW — branch `feat/lms-picks-and-fixtures-layout`, PR into `staging` (do not merge).
+
+Three layout/interaction changes from pass-1 review, built on the approved LMS v5 canvas
+(Frame 4 mobile / Frame 7 desktop), reusing existing primitives:
+
+1. **Top-3 above the fixtures list.** Swapped `Top3Section` before `FixturesSection` in the
+   competition view. `Top3Section` list is now responsive: mobile stacks vertically (#1 first);
+   desktop lays the three ranked cards in one 12-col row — #1 dominant (`md:col-span-6`, keeps the
+   `Card selected` / "#1 · Safest banker" accent treatment), #2 & #3 compact (`md:col-span-3`). The
+   compact `PickCard` was rebuilt as a vertical mini-card (badge · team · win% · scouting · full-width
+   "Back this pick") so it reads well both stacked and in a narrow column. No horizontal scroller.
+2. **Fixture row — back either team, lock out used teams.** `FixtureRow` no longer shows a single
+   favoured "Back". A new `buildSidePick(fixture, isHome)` yields a RankedPick for either side; a
+   per-side controls row renders under the summary — a "Back <team>" button per side (opens the same
+   `SubmitConfirmSheet`), or, for a team already spent this season, a disabled locked control
+   "Used · GW<n>" (Lock icon) with that side's `ClubBadge` in the `used` state. The spent round comes
+   from a new `usedGwByTeamId` map derived from the entry's real submitted `picks` (not re-derived).
+   Back buttons sit outside the expand-toggle button (no nested buttons).
+3. **Divergence callout.** Confirmed the "Model X% · Market Y% — worth a look" callout is not present
+   in the current fixtures list on `staging` — nothing to remove. (The unrelated "Market unavailable —
+   model estimate" availability badge is left as-is; flagged for Phil.)
+
+Verify: `npx tsc --noEmit` (0), `npm test` (51 passing), `npm run build` (exit 0). Renders at 360/1280.

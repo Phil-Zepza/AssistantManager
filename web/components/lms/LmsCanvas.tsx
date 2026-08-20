@@ -8,6 +8,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Clock,
+  Lock,
   Minus,
   Pencil,
   Plus,
@@ -148,6 +149,28 @@ function pickFromFixture(
   if (homeOk) return homePick();
   if (awayOk) return awayPick();
   return null;
+}
+
+// A backable RankedPick for one *specific* side of a fixture, regardless of
+// which team is favoured. Used by the fixture row where either side can be
+// backed. Returns null when that side has no team or no model probability.
+function buildSidePick(
+  f: LmsGameweekFixture,
+  isHome: boolean,
+): RankedPick | null {
+  const team = isHome ? f.homeTeam : f.awayTeam;
+  const pWin = isHome ? f.pHome : f.pAway;
+  if (team == null || pWin == null) return null;
+  return {
+    fixtureId: f.fixtureId,
+    fixture: f,
+    team,
+    opponent: isHome ? f.awayTeam : f.homeTeam,
+    pWin,
+    pDraw: f.pDraw,
+    pLoss: (isHome ? f.pAway : f.pHome) ?? null,
+    isHome,
+  };
 }
 
 function getRankedPicks(
@@ -500,6 +523,16 @@ export function LmsCanvas({
     [compDetail?.fixtures, usedTeamIds],
   );
 
+  // Round each used team was spent in, for the fixture-row lockout ("Used · GW6").
+  // Derived from this entry's real submitted picks — not re-derived from probs.
+  const usedGwByTeamId = useMemo(() => {
+    const m = new Map<number, number>();
+    for (const p of selectedEntry?.detail.picks ?? []) {
+      if (p.team?.fpl_id != null) m.set(p.team.fpl_id, p.gw);
+    }
+    return m;
+  }, [selectedEntry?.detail.picks]);
+
   const teamStatsById = useMemo(
     () => new Map((compDetail?.teamStats ?? []).map((s) => [s.teamId, s])),
     [compDetail?.teamStats],
@@ -710,15 +743,6 @@ export function LmsCanvas({
         />
       ) : (
         <>
-          <FixturesSection
-            fixtures={compDetail.fixtures}
-            currentGw={currentGw}
-            usedTeamIds={usedTeamIds}
-            teamStatsById={teamStatsById}
-            canPick={canPick}
-            onBackPick={(pick) => setConfirmPick(pick)}
-          />
-
           <Top3Section
             currentGw={currentGw}
             rankedPicks={rankedPicks}
@@ -726,6 +750,15 @@ export function LmsCanvas({
             canPick={canPick}
             spreadView={compDetail.spreadView}
             selectedEntryId={selectedEntryId}
+            onBackPick={(pick) => setConfirmPick(pick)}
+          />
+
+          <FixturesSection
+            fixtures={compDetail.fixtures}
+            currentGw={currentGw}
+            usedGwByTeamId={usedGwByTeamId}
+            teamStatsById={teamStatsById}
+            canPick={canPick}
             onBackPick={(pick) => setConfirmPick(pick)}
           />
 
@@ -1120,14 +1153,14 @@ function EntryHeader({
 function FixturesSection({
   fixtures,
   currentGw,
-  usedTeamIds,
+  usedGwByTeamId,
   teamStatsById,
   canPick,
   onBackPick,
 }: {
   fixtures: LmsGameweekFixture[];
   currentGw: number | null;
-  usedTeamIds: number[];
+  usedGwByTeamId: Map<number, number>;
   teamStatsById: Map<number, TeamScouting>;
   canPick: boolean;
   onBackPick: (pick: RankedPick) => void;
@@ -1152,7 +1185,7 @@ function FixturesSection({
             <FixtureRow
               key={f.fixtureId}
               fixture={f}
-              usedTeamIds={usedTeamIds}
+              usedGwByTeamId={usedGwByTeamId}
               teamStatsById={teamStatsById}
               canPick={canPick}
               expanded={expandedId === f.fixtureId}
@@ -1172,7 +1205,7 @@ function FixturesSection({
 
 function FixtureRow({
   fixture: f,
-  usedTeamIds,
+  usedGwByTeamId,
   teamStatsById,
   canPick,
   expanded,
@@ -1180,103 +1213,137 @@ function FixtureRow({
   onBackPick,
 }: {
   fixture: LmsGameweekFixture;
-  usedTeamIds: number[];
+  usedGwByTeamId: Map<number, number>;
   teamStatsById: Map<number, TeamScouting>;
   canPick: boolean;
   expanded: boolean;
   onToggle: () => void;
   onBackPick: (pick: RankedPick) => void;
 }) {
-  const used = new Set(usedTeamIds);
-  const homeUsed = f.homeTeam != null && used.has(f.homeTeam.fpl_id);
-  const awayUsed = f.awayTeam != null && used.has(f.awayTeam.fpl_id);
-
-  // Backable side of this fixture (favoured available team; null if none).
-  const pick = pickFromFixture(f, usedTeamIds);
+  const homeUsedGw =
+    f.homeTeam != null ? usedGwByTeamId.get(f.homeTeam.fpl_id) ?? null : null;
+  const awayUsedGw =
+    f.awayTeam != null ? usedGwByTeamId.get(f.awayTeam.fpl_id) ?? null : null;
+  const homeUsed = homeUsedGw != null;
+  const awayUsed = awayUsedGw != null;
 
   // Market-unavailable flag: no book has priced this fixture (usually a future
   // round), so the shown p_* is the model estimate rather than the market.
   const marketUnavailable =
     f.marketAvailable === false && (f.pHome != null || f.pAway != null);
 
+  // Per-side control: locked "Used · GW_" chip for a spent team, else a "Back"
+  // button that opens the same submit-confirm as the Top-3 cards. Either side is
+  // backable — not just the favoured one. Returns null when the side has no team
+  // or (while the round is open) no model probability to back.
+  function sideControl(isHome: boolean) {
+    const team = isHome ? f.homeTeam : f.awayTeam;
+    if (team == null) return null;
+    const usedGw = isHome ? homeUsedGw : awayUsedGw;
+    if (usedGw != null) {
+      return (
+        <Button
+          size="sm"
+          variant="secondary"
+          disabled
+          icon={<Lock aria-hidden />}
+          aria-label={`${team.short_name} already used in GW${usedGw}`}
+        >
+          Used · GW{usedGw}
+        </Button>
+      );
+    }
+    if (!canPick) return null;
+    const sp = buildSidePick(f, isHome);
+    if (!sp) return null;
+    return (
+      <Button
+        size="sm"
+        variant="secondary"
+        onClick={() => onBackPick(sp)}
+        aria-label={`Back ${team.short_name}`}
+      >
+        Back {team.short_name}
+      </Button>
+    );
+  }
+
+  const homeControl = sideControl(true);
+  const awayControl = sideControl(false);
+
   return (
     <Card padding="sm">
-      <div className="flex items-center gap-2">
-        {/* Expand toggle wraps the fixture summary */}
-        <button
-          type="button"
-          onClick={onToggle}
-          aria-expanded={expanded}
-          className="flex flex-1 items-center gap-3 min-w-0 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent rounded"
+      {/* Fixture summary — expand toggle. Back controls live in a separate row
+          below so they are never nested inside this button. */}
+      <button
+        type="button"
+        onClick={onToggle}
+        aria-expanded={expanded}
+        className="flex w-full items-center gap-3 min-w-0 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent rounded"
+      >
+        {/* Home side */}
+        <div
+          className={`flex items-center gap-2 flex-1 min-w-0 ${homeUsed ? "opacity-40" : ""}`}
         >
-          {/* Home side */}
-          <div
-            className={`flex items-center gap-2 flex-1 min-w-0 ${homeUsed ? "opacity-40" : ""}`}
-          >
-            <ClubBadge
-              code={f.homeTeam?.short_name}
-              size={32}
-              state={homeUsed ? "used" : "default"}
-            />
-            <div className="min-w-0">
-              <p className="text-sm font-semibold text-primary truncate">
-                {f.homeTeam?.short_name ?? "?"}
-              </p>
-              {f.pHome != null && (
-                <p className="text-xs font-bold tnum text-accent">
-                  {formatPct(f.pHome)}
-                </p>
-              )}
-            </div>
-          </div>
-
-          {/* Prob bar + vs */}
-          <div className="w-24 shrink-0">
-            <ProbBar home={f.pHome} draw={f.pDraw} away={f.pAway} />
-            <p className="mt-0.5 text-center text-[11px] text-muted">
-              {f.pDraw != null ? `D ${formatPct(f.pDraw)}` : "vs"}
-            </p>
-          </div>
-
-          {/* Away side */}
-          <div
-            className={`flex items-center gap-2 flex-1 min-w-0 justify-end ${awayUsed ? "opacity-40" : ""}`}
-          >
-            <div className="min-w-0 text-right">
-              <p className="text-sm font-semibold text-primary truncate">
-                {f.awayTeam?.short_name ?? "?"}
-              </p>
-              {f.pAway != null && (
-                <p className="text-xs font-bold tnum text-accent">
-                  {formatPct(f.pAway)}
-                </p>
-              )}
-            </div>
-            <ClubBadge
-              code={f.awayTeam?.short_name}
-              size={32}
-              state={awayUsed ? "used" : "default"}
-            />
-          </div>
-
-          <ChevronDown
-            className={`h-4 w-4 shrink-0 text-muted transition-transform duration-micro ${expanded ? "rotate-180" : ""}`}
-            aria-hidden
+          <ClubBadge
+            code={f.homeTeam?.short_name}
+            size={32}
+            state={homeUsed ? "used" : "default"}
           />
-        </button>
+          <div className="min-w-0">
+            <p className="text-sm font-semibold text-primary truncate">
+              {f.homeTeam?.short_name ?? "?"}
+            </p>
+            {f.pHome != null && (
+              <p className="text-xs font-bold tnum text-accent">
+                {formatPct(f.pHome)}
+              </p>
+            )}
+          </div>
+        </div>
 
-        {/* Back control — any fixture is backable (favoured available side) */}
-        {canPick && pick && (
-          <Button
-            size="sm"
-            variant="secondary"
-            className="shrink-0"
-            onClick={() => onBackPick(pick)}
-          >
-            Back {pick.team.short_name}
-          </Button>
-        )}
-      </div>
+        {/* Prob bar + draw */}
+        <div className="w-24 shrink-0">
+          <ProbBar home={f.pHome} draw={f.pDraw} away={f.pAway} />
+          <p className="mt-0.5 text-center text-[11px] text-muted">
+            {f.pDraw != null ? `D ${formatPct(f.pDraw)}` : "vs"}
+          </p>
+        </div>
+
+        {/* Away side */}
+        <div
+          className={`flex items-center gap-2 flex-1 min-w-0 justify-end ${awayUsed ? "opacity-40" : ""}`}
+        >
+          <div className="min-w-0 text-right">
+            <p className="text-sm font-semibold text-primary truncate">
+              {f.awayTeam?.short_name ?? "?"}
+            </p>
+            {f.pAway != null && (
+              <p className="text-xs font-bold tnum text-accent">
+                {formatPct(f.pAway)}
+              </p>
+            )}
+          </div>
+          <ClubBadge
+            code={f.awayTeam?.short_name}
+            size={32}
+            state={awayUsed ? "used" : "default"}
+          />
+        </div>
+
+        <ChevronDown
+          className={`h-4 w-4 shrink-0 text-muted transition-transform duration-micro ${expanded ? "rotate-180" : ""}`}
+          aria-hidden
+        />
+      </button>
+
+      {/* Back / used-lockout controls — one per side, either team backable. */}
+      {(homeControl || awayControl) && (
+        <div className="mt-2.5 flex items-center justify-between gap-2 border-t border-subtle pt-2.5">
+          <div className="flex justify-start">{homeControl}</div>
+          <div className="flex justify-end">{awayControl}</div>
+        </div>
+      )}
 
       {marketUnavailable && (
         <div className="mt-2 flex justify-center">
@@ -1397,17 +1464,23 @@ function Top3Section({
           </p>
         </Card>
       ) : (
-        <div className="space-y-3">
+        // Mobile: stacked, #1 first. Desktop: one row, #1 dominant (col-span-6)
+        // with #2 and #3 compact (col-span-3) alongside it.
+        <div className="space-y-3 md:grid md:grid-cols-12 md:items-start md:gap-3 md:space-y-0">
           {rankedPicks.map((pick, i) => (
-            <PickCard
+            <div
               key={pick.fixtureId}
-              pick={pick}
-              rank={i + 1}
-              canPick={canPick}
-              scouting={teamStatsById.get(pick.team.fpl_id)}
-              isCleanAlternative={cleanAlternative?.fixtureId === pick.fixtureId}
-              onBackPick={onBackPick}
-            />
+              className={i === 0 ? "md:col-span-6" : "md:col-span-3"}
+            >
+              <PickCard
+                pick={pick}
+                rank={i + 1}
+                canPick={canPick}
+                scouting={teamStatsById.get(pick.team.fpl_id)}
+                isCleanAlternative={cleanAlternative?.fixtureId === pick.fixtureId}
+                onBackPick={onBackPick}
+              />
+            </div>
           ))}
         </div>
       )}
@@ -1496,7 +1569,7 @@ function PickCard({
 
   if (rank === 1) {
     return (
-      <Card selected>
+      <Card selected className="h-full">
         <div className="flex items-center justify-between gap-3 mb-3">
           <div className="flex items-center gap-3">
             <ClubBadge code={pick.team.short_name} size={64} state="recommended" />
@@ -1547,20 +1620,22 @@ function PickCard({
     );
   }
 
+  // Compact card (#2 / #3). Vertical layout so it reads well both stacked at
+  // full width (mobile) and in its narrow desktop column.
   return (
-    <Card padding="sm">
-      <div className="flex items-center gap-3">
-        <span className="w-5 shrink-0 text-center text-sm font-bold text-muted">
+    <Card padding="sm" className="flex h-full flex-col">
+      <div className="flex items-center gap-2.5">
+        <span className="grid h-5 w-5 shrink-0 place-items-center rounded bg-surface-2 text-xs font-bold text-muted">
           {rank}
         </span>
         <ClubBadge code={pick.team.short_name} size={32} />
         <div className="min-w-0 flex-1">
           <p className="truncate text-sm font-semibold text-primary">
             {pick.team.name}{" "}
-            <span className="font-medium text-secondary">({venue})</span>{" "}
-            <span className="text-xs text-muted">
-              v {pick.opponent?.short_name ?? "TBD"}
-            </span>
+            <span className="font-medium text-secondary">({venue})</span>
+          </p>
+          <p className="truncate text-[11px] text-muted">
+            v {pick.opponent?.short_name ?? "TBD"}
           </p>
         </div>
         <span className="shrink-0 text-right">
@@ -1569,20 +1644,29 @@ function PickCard({
           </span>
           <span className="text-[11px] text-muted">win</span>
         </span>
-        {isCleanAlternative && (
-          <Badge tone="success">✓ No other entry</Badge>
-        )}
-        {canPick && (
-          <Button size="sm" variant="secondary" onClick={() => onBackPick(pick)}>
-            Back
-          </Button>
-        )}
       </div>
+
+      {isCleanAlternative && (
+        <div className="mt-2">
+          <Badge tone="success">✓ No other entry on this</Badge>
+        </div>
+      )}
 
       {/* Full detail always shown on pick cards */}
       <div className="mt-2.5 border-t border-subtle pt-2.5">
         <ScoutingDetail scouting={scouting} />
       </div>
+
+      {canPick && (
+        <Button
+          size="sm"
+          variant="secondary"
+          className="mt-3 w-full"
+          onClick={() => onBackPick(pick)}
+        >
+          Back this pick
+        </Button>
+      )}
     </Card>
   );
 }
