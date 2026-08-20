@@ -3,10 +3,13 @@
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
+  Ban,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
   Clock,
+  Minus,
+  Pencil,
   Plus,
   Zap,
 } from "lucide-react";
@@ -23,17 +26,21 @@ import {
   ProbBar,
   SegmentedControl,
   StatBlock,
+  Toggle,
 } from "@/components/ui";
 import {
   computeForwardPlan,
   computeCompetitionPlan,
   computeDefaultDeadline,
+  roundSkipStatus,
   type CompetitionPlan,
   type ForwardPlan,
   type PlannedPick,
+  type PlannerCompetition,
   type PlannerPin,
   type PlannerFixtureProb,
   type PlannerTeam,
+  type RoundSkipStatus,
   type SpreadPlannedPick,
   type SpreadSource,
 } from "@/lib/lmsPlanner";
@@ -46,6 +53,9 @@ import {
   setRoundDeadline,
   setSpreadMode,
   setSpreadOverride,
+  setAutoSkipThreshold,
+  skipRound,
+  unskipRound,
 } from "@/app/actions";
 import { formatPct } from "@/lib/format";
 import { deriveGwStatus, GW_STATUS_LABEL } from "@/lib/lmsStatus";
@@ -345,6 +355,19 @@ export function LmsCanvas({
   );
   const [spreadSaving, setSpreadSaving] = useState(false);
 
+  // Competition-scoped auto-skip threshold + manual skips (optimistic until the
+  // server action lands via router.refresh). These drive a client-side plan
+  // recompute so rounds cross the skip boundary live — nothing about future
+  // rounds is persisted here beyond the skip config itself.
+  const [autoSkipThreshold, setAutoSkipThresholdLocal] = useState<number | null>(
+    compDetail?.competition.autoSkipUnderFixtures ?? null,
+  );
+  const [skippedRounds, setSkippedRoundsLocal] = useState<
+    { gw: number; reason: string | null }[]
+  >(compDetail ? [...compDetail.competition.skippedRounds] : []);
+  const [autoSkipSaving, setAutoSkipSaving] = useState(false);
+  const [skipSaving, setSkipSaving] = useState(false);
+
   // Modal / sheet states
   const [addCompOpen, setAddCompOpen] = useState(false);
   const [addEntryOpen, setAddEntryOpen] = useState(false);
@@ -369,6 +392,20 @@ export function LmsCanvas({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [compDetail?.competition.id, compDetail?.competition.spreadMode]);
 
+  // Sync auto-skip threshold + manual skips from server (a router.refresh after
+  // any skip action returns fresh arrays/values; reconcile optimistic state).
+  useEffect(() => {
+    if (compDetail) {
+      setAutoSkipThresholdLocal(compDetail.competition.autoSkipUnderFixtures);
+      setSkippedRoundsLocal([...compDetail.competition.skippedRounds]);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    compDetail?.competition.id,
+    compDetail?.competition.autoSkipUnderFixtures,
+    compDetail?.competition.skippedRounds,
+  ]);
+
   const selectedEntry =
     compDetail?.entries.find((e) => e.detail.id === selectedEntryId) ??
     compDetail?.entries[0] ??
@@ -387,10 +424,23 @@ export function LmsCanvas({
 
   // Forward plan: pure recompute on every local override
   const planInputs = selectedEntry?.planInputs ?? null;
-  const plan = useMemo((): ForwardPlan | null => {
+
+  // Overlay the optimistic skip config onto the planner competition so a
+  // skip/unskip or threshold change recomputes the horizon client-side.
+  const effectiveCompetition = useMemo<PlannerCompetition | null>(() => {
     if (!planInputs) return null;
+    return {
+      ...planInputs.competition,
+      autoSkipUnderFixtures: autoSkipThreshold,
+      skippedRounds,
+    };
+  }, [planInputs, autoSkipThreshold, skippedRounds]);
+
+  const plan = useMemo((): ForwardPlan | null => {
+    if (!planInputs || !effectiveCompetition) return null;
     return computeForwardPlan({
       ...planInputs,
+      competition: effectiveCompetition,
       entryState: {
         ...planInputs.entryState,
         strategy: strategyMode,
@@ -399,11 +449,12 @@ export function LmsCanvas({
       },
       pins,
     });
-  }, [planInputs, strategyMode, floorPct, reserveIds, pins]);
+  }, [planInputs, effectiveCompetition, strategyMode, floorPct, reserveIds, pins]);
 
   // Cross-entry competition plan — only when ≥2 alive entries
   const competitionPlan = useMemo((): CompetitionPlan | null => {
-    if (!planInputs || planInputs.aliveEntries.length < 2) return null;
+    if (!planInputs || !effectiveCompetition || planInputs.aliveEntries.length < 2)
+      return null;
     return computeCompetitionPlan({
       entries: planInputs.aliveEntries.map((e) => ({
         ...e,
@@ -416,15 +467,31 @@ export function LmsCanvas({
       spreadMode: spreadMode as "off" | "soft" | "strong",
       spreadFloorSoft: compDetail?.competition.spreadFloorSoft ?? 0.65,
       overrides: planInputs.spreadOverrides,
-      competition: planInputs.competition,
+      competition: effectiveCompetition,
     });
-  }, [planInputs, selectedEntryId, pins, spreadMode, compDetail?.competition.spreadFloorSoft]);
+  }, [planInputs, effectiveCompetition, selectedEntryId, pins, spreadMode, compDetail?.competition.spreadFloorSoft]);
 
   // Spread picks for the currently selected entry from the competition plan
   const selectedSpreadPicks = competitionPlan?.entries
     .find((e) => e.entryId === selectedEntryId)?.picks ?? null;
 
   const usedTeamIds = selectedEntry?.detail.usedTeamIds ?? [];
+
+  // Skip status for the round currently open in the override sheet — drives
+  // whether that sheet shows the pick list + "Skip this round", the manual-skip
+  // panel (edit/restore), or the read-only auto-skip explainer.
+  const overrideRound =
+    overrideGw != null
+      ? planInputs?.upcomingRounds.find((r) => r.gw === overrideGw) ?? null
+      : null;
+  const overrideSkipStatus: RoundSkipStatus | null =
+    overrideRound && effectiveCompetition
+      ? roundSkipStatus(overrideRound, effectiveCompetition)
+      : null;
+  const overrideManualReason =
+    overrideGw != null
+      ? skippedRounds.find((s) => s.gw === overrideGw)?.reason ?? null
+      : null;
 
   const rankedPicks = useMemo(
     () => getRankedPicks(compDetail?.fixtures ?? [], usedTeamIds),
@@ -493,6 +560,51 @@ export function LmsCanvas({
     if (!compDetail) return;
     await setSpreadOverride(compDetail.competition.id, gw, forceSame);
     router.refresh();
+  }
+
+  // ── Skip handlers (competition-scoped) ─────────────────────────────────────
+
+  async function handleAutoSkipThreshold(n: number | null) {
+    if (!compDetail) return;
+    setAutoSkipThresholdLocal(n);
+    setAutoSkipSaving(true);
+    try {
+      await setAutoSkipThreshold(compDetail.competition.id, n);
+      router.refresh();
+    } finally {
+      setAutoSkipSaving(false);
+    }
+  }
+
+  async function handleSkipRound(gw: number, reason?: string) {
+    if (!compDetail) return;
+    const trimmed = reason?.trim();
+    const value = trimmed && trimmed.length > 0 ? trimmed : null;
+    setSkippedRoundsLocal((prev) => [
+      ...prev.filter((s) => s.gw !== gw),
+      { gw, reason: value },
+    ]);
+    setOverrideGw(null);
+    setSkipSaving(true);
+    try {
+      await skipRound(compDetail.competition.id, gw, reason);
+      router.refresh();
+    } finally {
+      setSkipSaving(false);
+    }
+  }
+
+  async function handleUnskipRound(gw: number) {
+    if (!compDetail) return;
+    setSkippedRoundsLocal((prev) => prev.filter((s) => s.gw !== gw));
+    setOverrideGw(null);
+    setSkipSaving(true);
+    try {
+      await unskipRound(compDetail.competition.id, gw);
+      router.refresh();
+    } finally {
+      setSkipSaving(false);
+    }
   }
 
   // ── Pin override handlers ──────────────────────────────────────────────────
@@ -613,9 +725,17 @@ export function LmsCanvas({
               spreadMode={spreadMode}
               spreadFloorSoft={compDetail.competition.spreadFloorSoft}
               autoCollapsedGws={competitionPlan?.autoCollapsedGws ?? []}
+              skippedRounds={skippedRounds}
               onTileClick={(gw) => setOverrideGw(gw)}
               onClearPin={handleClearPin}
               onSpreadOverride={handleSpreadOverride}
+            />
+          )}
+
+          {plan && planInputs && (
+            <SummarySection
+              picks={selectedSpreadPicks ?? plan.picks}
+              teams={planInputs.teams}
             />
           )}
 
@@ -629,11 +749,14 @@ export function LmsCanvas({
               spreadMode={spreadMode}
               spreadSaving={spreadSaving}
               totalEntryCount={compDetail.competition.entries.length}
+              autoSkipThreshold={autoSkipThreshold}
+              autoSkipSaving={autoSkipSaving}
               onStrategyChange={handleStrategyChange}
               onFloorChange={setFloorPct}
               onFloorCommit={handleFloorCommit}
               onReserveToggle={handleReserveToggle}
               onSpreadModeChange={handleSpreadMode}
+              onAutoSkipChange={handleAutoSkipThreshold}
               onAddEntry={() => setAddEntryOpen(true)}
             />
           )}
@@ -694,6 +817,11 @@ export function LmsCanvas({
               .map((p) => p.teamId),
           ]}
           onSelect={handlePinSelect}
+          skipStatus={overrideSkipStatus}
+          manualReason={overrideManualReason}
+          skipSaving={skipSaving}
+          onSkip={handleSkipRound}
+          onUnskip={handleUnskipRound}
         />
       )}
     </div>
@@ -1469,6 +1597,7 @@ function ForwardPlanSection({
   spreadMode,
   spreadFloorSoft,
   autoCollapsedGws,
+  skippedRounds,
   onTileClick,
   onClearPin,
   onSpreadOverride,
@@ -1482,11 +1611,21 @@ function ForwardPlanSection({
   spreadMode: LmsSpreadMode;
   spreadFloorSoft: number;
   autoCollapsedGws: number[];
+  skippedRounds: { gw: number; reason: string | null }[];
   onTileClick: (gw: number) => void;
   onClearPin: (gw: number) => void;
   onSpreadOverride: (gw: number, forceSame: boolean) => void;
 }) {
   const teamById = new Map(planInputs.teams.map((t) => [t.id, t]));
+
+  // Per-round fixture counts (for the auto-skip "N games" caption) and manual
+  // skip reasons (to tell "has reason" from the planner's default reason text).
+  const numFixturesByGw = new Map(
+    planInputs.upcomingRounds.map((r) => [r.gw, r.numFixtures]),
+  );
+  const manualReasonByGw = new Map(
+    skippedRounds.map((s) => [s.gw, s.reason]),
+  );
 
   // When we have a competition plan, use its picks (may pick different teams)
   const picks: PlannedPick[] = spreadPicks ?? plan.picks;
@@ -1564,6 +1703,8 @@ function ForwardPlanSection({
                 spreadMarker={spreadMarker}
                 spreadFloorSoft={spreadFloorSoft}
                 isPinned={pins.some((p) => p.gw === pick.gw)}
+                manualReason={manualReasonByGw.get(pick.gw) ?? null}
+                numFixtures={numFixturesByGw.get(pick.gw) ?? null}
                 onClick={() => onTileClick(pick.gw)}
                 onClearPin={() => onClearPin(pick.gw)}
               />
@@ -1571,6 +1712,8 @@ function ForwardPlanSection({
           })}
         </div>
       )}
+
+      <PlanLegend />
 
       {plan.reserves.length > 0 && (
         <div className="mt-2 flex items-center gap-2 flex-wrap">
@@ -1597,12 +1740,150 @@ function ForwardPlanSection({
   );
 }
 
+// ─── Competition: plan summary grid (Frame 10) ───────────────────────────────
+
+// One at-a-glance cell per horizon round. Skip cells reuse the dashed/ban token
+// at grid-cell size; a manual skip carries a small corner dot so it reads apart
+// from the automatic case at grid density. Driven purely from pick.skipKind.
+function SummaryCell({
+  pick,
+  teamById,
+}: {
+  pick: PlannedPick;
+  teamById: Map<number, PlannerTeam>;
+}) {
+  const isSkipped = pick.flags.includes("skipped");
+
+  if (isSkipped) {
+    const isManual = pick.skipKind === "manual";
+    return (
+      <div
+        className={`relative flex aspect-square flex-col items-center justify-center rounded-md border border-dashed bg-surface/50 ${
+          isManual ? "border-strong" : "border-subtle opacity-60"
+        }`}
+        title={pick.reason}
+      >
+        {isManual && (
+          <span
+            className="absolute right-1 top-1 h-1.5 w-1.5 rounded-full bg-secondary"
+            aria-hidden
+          />
+        )}
+        <Ban
+          className={`h-4 w-4 ${isManual ? "text-secondary" : "text-muted"}`}
+          aria-hidden
+        />
+        <span
+          className={`mt-0.5 text-[9px] font-semibold ${
+            isManual ? "text-secondary" : "text-muted"
+          }`}
+        >
+          GW{pick.gw}
+        </span>
+      </div>
+    );
+  }
+
+  const team = pick.teamId != null ? teamById.get(pick.teamId) : null;
+  return (
+    <div
+      className="flex aspect-square flex-col items-center justify-center rounded-md border border-subtle bg-surface"
+      title={pick.reason}
+    >
+      {team ? (
+        <ClubBadge code={team.shortName} size={24} />
+      ) : (
+        <span className="text-[10px] text-muted">—</span>
+      )}
+      <span className="mt-0.5 text-[9px] font-semibold text-muted">
+        GW{pick.gw}
+      </span>
+    </div>
+  );
+}
+
+function SummarySection({
+  picks,
+  teams,
+}: {
+  picks: PlannedPick[];
+  teams: PlannerTeam[];
+}) {
+  const teamById = useMemo(
+    () => new Map(teams.map((t) => [t.id, t])),
+    [teams],
+  );
+  if (picks.length === 0) return null;
+  return (
+    <section className="mb-5">
+      <h2 className="mb-2 text-sm font-semibold uppercase tracking-wider text-muted">
+        Summary
+      </h2>
+      <Card>
+        <div
+          className="grid gap-1.5"
+          style={{
+            gridTemplateColumns: "repeat(auto-fill, minmax(44px, 1fr))",
+          }}
+        >
+          {picks.map((pick) => (
+            <SummaryCell key={pick.gw} pick={pick} teamById={teamById} />
+          ))}
+        </div>
+      </Card>
+    </section>
+  );
+}
+
+// Compact legend for the forward-plan tiles. Split "Skipped" into its auto and
+// manual variants so the two dashed treatments read unambiguously.
+function PlanLegend() {
+  return (
+    <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1.5 text-[10px] text-muted">
+      <span className="flex items-center gap-1.5">
+        <span className="inline-block h-2.5 w-2.5 rounded-full bg-accent" aria-hidden />
+        Matched
+      </span>
+      <span className="flex items-center gap-1.5">
+        <span className="inline-block h-2.5 w-2.5 rounded-full bg-success" aria-hidden />
+        Spread
+      </span>
+      <span className="flex items-center gap-1.5">
+        <span className="inline-block h-2.5 w-2.5 rounded-full bg-warning" aria-hidden />
+        Reserved
+      </span>
+      <span className="flex items-center gap-1.5">
+        <span
+          className="inline-block h-2.5 w-2.5 rounded-sm border-2 border-accent"
+          aria-hidden
+        />
+        Manual override
+      </span>
+      <span className="flex items-center gap-1.5">
+        <span
+          className="inline-block h-2.5 w-3.5 rounded-sm border border-dashed border-subtle opacity-60"
+          aria-hidden
+        />
+        Skipped · auto
+      </span>
+      <span className="flex items-center gap-1.5 text-secondary">
+        <span className="relative inline-flex h-2.5 w-3.5 items-center justify-center rounded-sm border border-dashed border-strong">
+          <Pencil className="h-2 w-2 text-secondary" aria-hidden />
+        </span>
+        Skipped · manual
+      </span>
+    </div>
+  );
+}
+
 function PlanTile({
   pick,
   teamById,
   spreadMarker,
   spreadFloorSoft,
   isPinned,
+  manualReason,
+  numFixtures,
   onClick,
   onClearPin,
 }: {
@@ -1611,6 +1892,8 @@ function PlanTile({
   spreadMarker?: "matched" | "spread" | "belowFloor";
   spreadFloorSoft?: number;
   isPinned: boolean;
+  manualReason?: string | null;
+  numFixtures?: number | null;
   onClick: () => void;
   onClearPin: () => void;
 }) {
@@ -1625,20 +1908,57 @@ function PlanTile({
   const isNoPick = flags.includes("noPick");
 
   if (isSkipped) {
-    // skipKind tells auto (fixture-count threshold) from manual (user skip). The
-    // short label is the reason up to the em-dash ("under 7 fixtures", the user's
-    // reason, or "manually skipped"); the full reason is the tooltip.
-    const shortReason = pick.reason.split(" — ")[0];
+    // skipKind (from the planner) tells auto (fixture-count threshold) from
+    // manual (user skip). Both tiles tap to open the round sheet — manual shows
+    // its reason + edit/restore controls; auto shows a read-only explainer.
+    if (pick.skipKind === "manual") {
+      const hasReason = manualReason != null && manualReason.trim().length > 0;
+      return (
+        <button
+          type="button"
+          onClick={onClick}
+          className="relative flex w-28 shrink-0 flex-col items-center justify-center rounded-lg border border-dashed border-strong bg-surface/50 px-2 py-3 text-center focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+          title={pick.reason}
+        >
+          <Pencil
+            className="absolute right-1.5 top-1.5 h-3 w-3 text-secondary"
+            aria-hidden
+          />
+          <Ban className="h-4 w-4 text-secondary" aria-hidden />
+          <span className="mt-1 text-xs font-semibold text-secondary">
+            GW{pick.gw}
+          </span>
+          <span className="mt-0.5 text-[10px] font-medium text-secondary leading-tight">
+            Skipped · manual
+          </span>
+          <span className="mt-0.5 w-full truncate text-[10px] text-muted leading-tight">
+            {hasReason ? manualReason : "tap to add reason"}
+          </span>
+        </button>
+      );
+    }
+    // auto: fixture-count threshold — muted, "N games · under {threshold}"
+    const shortReason = pick.reason.split(" — ")[0]; // e.g. "under 7 fixtures"
+    const games =
+      numFixtures != null
+        ? `${numFixtures} game${numFixtures === 1 ? "" : "s"} · `
+        : "";
     return (
-      <div
-        className="flex w-28 shrink-0 flex-col items-center justify-center rounded-lg border border-dashed border-subtle bg-surface/50 px-2 py-3 text-center opacity-50"
+      <button
+        type="button"
+        onClick={onClick}
+        className="flex w-28 shrink-0 flex-col items-center justify-center rounded-lg border border-dashed border-subtle bg-surface/50 px-2 py-3 text-center opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:opacity-100"
         title={pick.reason}
       >
-        <span className="text-xs font-semibold text-muted">GW{pick.gw}</span>
-        <span className="mt-0.5 text-[10px] text-muted leading-tight">
-          Skipped · {shortReason}
+        <Ban className="h-4 w-4 text-muted" aria-hidden />
+        <span className="mt-1 text-xs font-semibold text-muted">
+          GW{pick.gw}
         </span>
-      </div>
+        <span className="mt-0.5 text-[10px] text-muted leading-tight">
+          Skipped · {games}
+          {shortReason}
+        </span>
+      </button>
     );
   }
 
@@ -1820,6 +2140,90 @@ function SpreadControl({
   );
 }
 
+// Competition-scoped auto-skip rule — a numeric threshold + on/off toggle at the
+// same visual tier as the spread control. Off = null (no fixture-count rule).
+const DEFAULT_AUTO_SKIP = 7;
+
+function AutoSkipControl({
+  threshold,
+  saving,
+  onChange,
+}: {
+  threshold: number | null;
+  saving: boolean;
+  onChange: (n: number | null) => void;
+}) {
+  const enabled = threshold != null;
+  const value = threshold ?? DEFAULT_AUTO_SKIP;
+  return (
+    <div>
+      <div className="mb-2 flex items-center gap-2">
+        <Badge tone="gray">COMPETITION</Badge>
+        <span className="text-xs text-muted">Auto-skip small rounds</span>
+      </div>
+      <div className="rounded-lg border border-subtle bg-surface-2 p-3">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <span
+              className={`text-sm font-medium ${
+                enabled ? "text-secondary" : "text-secondary opacity-50"
+              }`}
+            >
+              Skip rounds under
+            </span>
+            <div
+              className={`flex items-center rounded-lg border border-strong bg-raised ${
+                enabled ? "" : "opacity-50"
+              }`}
+            >
+              <button
+                type="button"
+                disabled={!enabled || value <= 1}
+                onClick={() => onChange(value - 1)}
+                aria-label="Decrease fixture threshold"
+                className="flex h-8 w-8 items-center justify-center text-secondary hover:text-primary disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent rounded-l-lg"
+              >
+                <Minus className="h-3.5 w-3.5" aria-hidden />
+              </button>
+              <span className="w-8 text-center text-sm font-bold tnum text-primary">
+                {value}
+              </span>
+              <button
+                type="button"
+                disabled={!enabled}
+                onClick={() => onChange(value + 1)}
+                aria-label="Increase fixture threshold"
+                className="flex h-8 w-8 items-center justify-center text-secondary hover:text-primary disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent rounded-r-lg"
+              >
+                <Plus className="h-3.5 w-3.5" aria-hidden />
+              </button>
+            </div>
+            <span
+              className={`text-sm ${
+                enabled ? "text-secondary" : "text-secondary opacity-50"
+              }`}
+            >
+              PL fixtures
+            </span>
+          </div>
+          <Toggle
+            checked={enabled}
+            onChange={(on) => onChange(on ? DEFAULT_AUTO_SKIP : null)}
+            aria-label="Auto-skip rule on or off"
+          />
+        </div>
+        {!enabled && (
+          <p className="mt-2 text-xs text-muted">
+            No fixture-count rule for this competition — skip rounds manually
+            instead.
+          </p>
+        )}
+        {saving && <p className="mt-1 text-xs text-muted">Saving…</p>}
+      </div>
+    </div>
+  );
+}
+
 function StrategySection({
   entry,
   strategyMode,
@@ -1829,11 +2233,14 @@ function StrategySection({
   spreadMode,
   spreadSaving,
   totalEntryCount,
+  autoSkipThreshold,
+  autoSkipSaving,
   onStrategyChange,
   onFloorChange,
   onFloorCommit,
   onReserveToggle,
   onSpreadModeChange,
+  onAutoSkipChange,
   onAddEntry,
 }: {
   entry: LmsEntryDetail;
@@ -1844,11 +2251,14 @@ function StrategySection({
   spreadMode: LmsSpreadMode;
   spreadSaving: boolean;
   totalEntryCount: number;
+  autoSkipThreshold: number | null;
+  autoSkipSaving: boolean;
   onStrategyChange: (mode: LmsReserveStrategy) => void;
   onFloorChange: (pct: number) => void;
   onFloorCommit: (pct: number) => void;
   onReserveToggle: (teamId: number) => void;
   onSpreadModeChange: (mode: LmsSpreadMode) => void;
+  onAutoSkipChange: (n: number | null) => void;
   onAddEntry: () => void;
 }) {
   // Available teams for the manual reserve tray
@@ -1869,6 +2279,13 @@ function StrategySection({
             disabled={spreadDisabled}
             onSpreadModeChange={onSpreadModeChange}
             onAddEntry={onAddEntry}
+          />
+
+          {/* Competition-scoped auto-skip rule */}
+          <AutoSkipControl
+            threshold={autoSkipThreshold}
+            saving={autoSkipSaving}
+            onChange={onAutoSkipChange}
           />
 
           <div className="border-t border-subtle pt-4">
@@ -2735,6 +3152,11 @@ function PinPickerSheet({
   teams,
   excludedTeamIds,
   onSelect,
+  skipStatus,
+  manualReason,
+  skipSaving,
+  onSkip,
+  onUnskip,
 }: {
   gw: number | null;
   onClose: () => void;
@@ -2742,11 +3164,26 @@ function PinPickerSheet({
   teams: PlannerTeam[];
   excludedTeamIds: number[];
   onSelect: (gw: number, teamId: number) => void;
+  skipStatus: RoundSkipStatus | null;
+  manualReason: string | null;
+  skipSaving: boolean;
+  onSkip: (gw: number, reason?: string) => void;
+  onUnskip: (gw: number) => void;
 }) {
   const teamMap = useMemo(
     () => new Map(teams.map((t) => [t.id, t])),
     [teams],
   );
+
+  // Reason drafts: `reasonDraft` for skipping a normal round; `editReason` for
+  // the manual-skip edit-reason flow (null = not editing). Reset when the sheet
+  // switches rounds.
+  const [reasonDraft, setReasonDraft] = useState("");
+  const [editReason, setEditReason] = useState<string | null>(null);
+  useEffect(() => {
+    setReasonDraft("");
+    setEditReason(null);
+  }, [gw]);
 
   const candidates = useMemo(() => {
     if (gw == null) return [];
@@ -2768,46 +3205,175 @@ function PinPickerSheet({
     return arr.sort((a, b) => b.pWin - a.pWin);
   }, [gw, fixtureProbs, teamMap, excludedTeamIds]);
 
+  const isManualSkip = skipStatus?.skipped === true && skipStatus.kind === "manual";
+  const isAutoSkip = skipStatus?.skipped === true && skipStatus.kind === "auto";
+
+  const title =
+    gw == null
+      ? undefined
+      : isManualSkip
+        ? `GW${gw} skipped`
+        : isAutoSkip
+          ? `GW${gw} auto-skipped`
+          : `Override GW${gw} pick`;
+
   return (
-    <BottomSheet
-      open={gw != null}
-      onClose={onClose}
-      title={gw != null ? `Override GW${gw} pick` : undefined}
-    >
-      <div className="space-y-2">
-        <p className="text-xs text-muted">
-          Choose a team for GW{gw}. This overrides the plan in your browser
-          only — nothing is saved until you submit the actual pick.
-        </p>
-        {candidates.length === 0 ? (
-          <p className="text-sm text-secondary">
-            No available teams with model data for this round.
-          </p>
-        ) : (
-          candidates.map((c) => (
+    <BottomSheet open={gw != null} onClose={onClose} title={title}>
+      {isManualSkip ? (
+        // ── Already manually skipped: edit reason / restore / keep ────────────
+        <div className="space-y-3">
+          <div className="flex items-start gap-2">
+            <Ban className="mt-0.5 h-4 w-4 shrink-0 text-secondary" aria-hidden />
+            <div>
+              <p className="text-sm font-semibold text-secondary">
+                Skipped manually
+              </p>
+              <p className="mt-0.5 text-xs text-muted">
+                {manualReason && manualReason.trim().length > 0
+                  ? manualReason
+                  : "No reason given."}
+              </p>
+            </div>
+          </div>
+
+          {editReason != null ? (
+            <div className="space-y-2">
+              <Input
+                value={editReason}
+                onChange={(e) => setEditReason(e.target.value)}
+                placeholder="Reason (optional)"
+                aria-label="Edit skip reason"
+              />
+              <div className="flex gap-2">
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  disabled={skipSaving}
+                  onClick={() => gw != null && onSkip(gw, editReason)}
+                >
+                  Save reason
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setEditReason(null)}
+                >
+                  Cancel
+                </Button>
+              </div>
+            </div>
+          ) : (
             <button
-              key={c.teamId}
               type="button"
-              onClick={() => gw != null && onSelect(gw, c.teamId)}
-              className="flex w-full items-center gap-3 rounded-lg border border-subtle bg-surface px-3 py-2.5 text-left hover:border-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+              onClick={() => setEditReason(manualReason ?? "")}
+              className="flex items-center gap-1.5 text-xs font-semibold text-accent hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent rounded"
             >
-              <ClubBadge code={c.shortName} size={32} />
-              <span className="flex-1 text-sm font-semibold text-primary">
-                {c.shortName}{" "}
-                <span className="text-xs font-normal text-secondary">
-                  ({c.isHome ? "H" : "A"})
-                </span>
-              </span>
-              <span className="text-sm font-bold tnum text-accent">
-                {formatPct(c.pWin)}
-              </span>
+              <Pencil className="h-3.5 w-3.5" aria-hidden /> Edit reason
             </button>
-          ))
-        )}
-        <Button variant="ghost" onClick={onClose} fullWidth>
-          Cancel
-        </Button>
-      </div>
+          )}
+
+          <div className="border-t border-subtle pt-3">
+            <Button
+              variant="secondary"
+              fullWidth
+              disabled={skipSaving}
+              onClick={() => gw != null && onUnskip(gw)}
+            >
+              Restore auto-pick
+            </Button>
+            <p className="mt-1.5 text-xs text-muted">
+              Returns this round to a normal planned pick.
+            </p>
+            <Button
+              variant="ghost"
+              fullWidth
+              onClick={onClose}
+              className="mt-2"
+            >
+              Keep skipped
+            </Button>
+          </div>
+        </div>
+      ) : isAutoSkip ? (
+        // ── Auto-skipped: read-only explainer (governed by the threshold) ─────
+        <div className="space-y-3">
+          <div className="flex items-start gap-2">
+            <Ban className="mt-0.5 h-4 w-4 shrink-0 text-muted" aria-hidden />
+            <div>
+              <p className="text-sm font-semibold text-muted">Auto-skipped</p>
+              <p className="mt-0.5 text-xs text-muted">
+                {skipStatus?.skipped ? skipStatus.reason : ""}
+              </p>
+            </div>
+          </div>
+          <Callout tone="info">
+            This round is governed by the competition&rsquo;s auto-skip
+            threshold. Change &ldquo;Auto-skip small rounds&rdquo; in Strategy to
+            include it.
+          </Callout>
+          <Button variant="ghost" onClick={onClose} fullWidth>
+            Close
+          </Button>
+        </div>
+      ) : (
+        // ── Normal round: pick-override list + quiet "Skip this round" ────────
+        <div className="space-y-2">
+          <p className="text-xs text-muted">
+            Choose a team for GW{gw}. This overrides the plan in your browser
+            only — nothing is saved until you submit the actual pick.
+          </p>
+          {candidates.length === 0 ? (
+            <p className="text-sm text-secondary">
+              No available teams with model data for this round.
+            </p>
+          ) : (
+            candidates.map((c) => (
+              <button
+                key={c.teamId}
+                type="button"
+                onClick={() => gw != null && onSelect(gw, c.teamId)}
+                className="flex w-full items-center gap-3 rounded-lg border border-subtle bg-surface px-3 py-2.5 text-left hover:border-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+              >
+                <ClubBadge code={c.shortName} size={32} />
+                <span className="flex-1 text-sm font-semibold text-primary">
+                  {c.shortName}{" "}
+                  <span className="text-xs font-normal text-secondary">
+                    ({c.isHome ? "H" : "A"})
+                  </span>
+                </span>
+                <span className="text-sm font-bold tnum text-accent">
+                  {formatPct(c.pWin)}
+                </span>
+              </button>
+            ))
+          )}
+
+          {/* Quiet, subordinate skip action — not a primary button */}
+          <div className="mt-1 border-t border-subtle pt-3">
+            <Input
+              value={reasonDraft}
+              onChange={(e) => setReasonDraft(e.target.value)}
+              placeholder="Reason (optional)"
+              aria-label="Skip reason"
+            />
+            <button
+              type="button"
+              disabled={skipSaving}
+              onClick={() => gw != null && onSkip(gw, reasonDraft)}
+              className="mt-2 flex items-center gap-1.5 text-xs font-semibold text-secondary hover:text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent rounded disabled:opacity-50"
+            >
+              <Ban className="h-3.5 w-3.5" aria-hidden /> Skip this round
+            </button>
+            <p className="mt-1 text-xs text-muted">
+              No pick required — single-use teams stay untouched.
+            </p>
+          </div>
+
+          <Button variant="ghost" onClick={onClose} fullWidth className="mt-2">
+            Cancel
+          </Button>
+        </div>
+      )}
     </BottomSheet>
   );
 }
