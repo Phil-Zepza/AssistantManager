@@ -17,11 +17,7 @@ import type {
   Position,
   SquadSelection,
 } from "@/lib/types";
-import {
-  autoSoftApplies,
-  computeDefaultDeadline,
-  roundSkipStatus,
-} from "@/lib/lmsPlanner";
+import { autoSoftApplies, roundSkipStatus } from "@/lib/lmsPlanner";
 import { canMutatePick, validateChangeTarget } from "@/lib/lmsPickGate";
 import { getCompetitionSkip } from "@/lib/queries";
 
@@ -616,46 +612,12 @@ export async function submitPick(
   return { ok: true };
 }
 
-// One round's fixtures + effective deadline, for the server-side Open gate.
-// The effective deadline mirrors the read layer (queries.resolveNextDeadline): a
-// non-null override wins, otherwise the computed default (day before first
-// kickoff). Fixtures carry the teams too, so callers can also check a team plays.
-type GateFixture = {
-  kickoff: string | null;
-  finished: boolean;
-  home_team: number | null;
-  away_team: number | null;
-};
-async function loadRoundGate(
-  competitionId: number,
-  gw: number,
-): Promise<{ fixtures: GateFixture[]; deadline: string | null }> {
-  const [fixtures, overrideRows] = await Promise.all([
-    q<GateFixture>(
-      `select kickoff, finished, home_team, away_team from fixtures where gw = $1`,
-      [gw],
-    ),
-    q<{ deadline: string | null }>(
-      `select deadline from lms_competition_deadlines
-        where competition_id = $1 and gw = $2 and deadline is not null`,
-      [competitionId, gw],
-    ),
-  ]);
-  const deadline =
-    overrideRows[0]?.deadline ??
-    computeDefaultDeadline(
-      gw,
-      fixtures.map((f) => ({ gw, kickoff: f.kickoff })),
-    );
-  return { fixtures, deadline };
-}
-
-// Cancel a pending pick on an OPEN round: delete the lms_entry_picks row so both
-// unique constraints free up and the team returns to the entry's available pool.
-// The Open gate is re-validated server-side against freshly-loaded data before
-// the delete — a client that shows the control past the deadline (render-vs-
-// deadline race) is still refused. Idempotent: cancelling an already-absent pick
-// is a clean no-op. Never touches status/eliminated_gw or a resolved round.
+// Cancel a pending pick: delete the lms_entry_picks row so both unique
+// constraints free up and the team returns to the entry's available pool. The
+// ONLY gate is result-based — a pending pick is cancellable at ANY time, before
+// OR after the deadline; a resolved pick is refused. There is no time/deadline
+// gate. Idempotent: cancelling an already-absent pick is a clean no-op. Never
+// touches status/eliminated_gw or a resolved round.
 export async function cancelPick(
   entryId: number,
   gw: number,
@@ -681,14 +643,8 @@ export async function cancelPick(
   );
   if (pickRows.length === 0) return { ok: true };
 
-  // Server-enforced Open gate: the round must still be open and the pick pending.
-  const { fixtures, deadline } = await loadRoundGate(entry.competition_id, roundGw);
-  const gate = canMutatePick({
-    deadline,
-    fixtures,
-    nowMs: Date.now(),
-    pickResult: pickRows[0].result,
-  });
+  // Result-based gate only: refuse a resolved pick, allow a pending one.
+  const gate = canMutatePick({ pickResult: pickRows[0].result });
   if (!gate.ok) return { ok: false, error: gate.reason };
 
   await q(`delete from lms_entry_picks where entry_id = $1 and gw = $2`, [
@@ -699,12 +655,13 @@ export async function cancelPick(
   return { ok: true };
 }
 
-// Switch an OPEN round's pending pick to a different team, in one transaction.
-// Re-validates the Open gate + single-use-per-entry (unique(entry_id, team_id))
-// against row-locked state before the swap, so a control reached past the
-// deadline — or a team already spent in another round — is refused with a clear
-// error. The team_id UPDATE leaves gw/result untouched (stays 'pending') and
-// clears spread_source (this is a manual choice, not a planner allocation).
+// Switch a pending pick to a different team, in one transaction. The ONLY gate
+// is result-based (the pick must still be pending) — re-checked against
+// row-locked state; there is no deadline/time gate, so a pick is switchable
+// before OR after the deadline. The new team must play this round and must not
+// already be spent by the entry in another round (unique(entry_id, team_id)).
+// The team_id UPDATE leaves gw/result untouched (stays 'pending') and clears
+// spread_source (this is a manual choice, not a planner allocation).
 export async function changePick(
   entryId: number,
   gw: number,
@@ -726,11 +683,15 @@ export async function changePick(
   const entry = await loadOwnedEntry(userId, eId);
   if (!entry) return { ok: false, error: "Entry not found." };
 
-  // The new team must exist and have a fixture this round. Deadline + fixtures
-  // are read outside the tx (the pick swap can't change them).
-  const { fixtures, deadline } = await loadRoundGate(entry.competition_id, roundGw);
-  const plays = fixtures.some((f) => f.home_team === team || f.away_team === team);
-  if (!plays) return { ok: false, error: "That team has no fixture this round." };
+  // The new team must have a fixture this round (same rule as submitPick).
+  const playsRows = await q<{ n: string }>(
+    `select count(*)::text as n from fixtures
+       where gw = $1 and (home_team = $2 or away_team = $2)`,
+    [roundGw, team],
+  );
+  if (!playsRows[0] || Number(playsRows[0].n) === 0) {
+    return { ok: false, error: "That team has no fixture this round." };
+  }
 
   let result: { ok: boolean; error?: string } = { ok: true };
   try {
@@ -750,13 +711,8 @@ export async function changePick(
         return;
       }
 
-      // Open gate: round still open AND the pick still pending.
-      const gate = canMutatePick({
-        deadline,
-        fixtures,
-        nowMs: Date.now(),
-        pickResult: current.result,
-      });
+      // Result-based gate only: the pick must still be pending.
+      const gate = canMutatePick({ pickResult: current.result });
       if (!gate.ok) {
         result = { ok: false, error: gate.reason };
         return;

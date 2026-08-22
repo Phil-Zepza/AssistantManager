@@ -1,103 +1,47 @@
 import { describe, it, expect } from "vitest";
-import { canMutatePick, validateChangeTarget } from "./lmsPickGate";
-import type { StatusFixture } from "./lmsStatus";
+import {
+  canMutatePick,
+  pickLockLabel,
+  validateChangeTarget,
+} from "./lmsPickGate";
 
-// Fixed reference clock and relative helpers (ms).
-const NOW = new Date("2026-08-15T12:00:00Z").getTime();
-const HOUR = 3600_000;
-const iso = (offsetHours: number) =>
-  new Date(NOW + offsetHours * HOUR).toISOString();
-
-function fx(kickoffOffsetH: number | null, finished = false): StatusFixture {
-  return { kickoff: kickoffOffsetH == null ? null : iso(kickoffOffsetH), finished };
-}
-
-describe("canMutatePick — the Open + pending gate", () => {
-  it("allows a pending pick while the round is open (before the deadline)", () => {
-    expect(
-      canMutatePick({
-        deadline: iso(24), // deadline in the future
-        fixtures: [fx(30), fx(32)],
-        nowMs: NOW,
-        pickResult: "pending",
-      }),
-    ).toEqual({ ok: true });
+// The gate is result-based ONLY — there is no time/deadline input at all. A
+// pending pick is editable whenever, regardless of the clock; a resolved pick is
+// locked. This is the critical correctness contract for cancelPick / changePick.
+describe("canMutatePick — the result-based gate (no time gate)", () => {
+  it("allows a pending pick (the only condition for editability)", () => {
+    expect(canMutatePick({ pickResult: "pending" })).toEqual({ ok: true });
   });
 
-  it("allows a pending pick when no deadline is known yet and kickoff is future", () => {
-    expect(
-      canMutatePick({
-        deadline: null,
-        fixtures: [fx(30)],
-        nowMs: NOW,
-        pickResult: "pending",
-      }).ok,
-    ).toBe(true);
+  it("stays editable regardless of time — there is no deadline input", () => {
+    // Encodes the acceptance rule: a pending pick past its deadline is still
+    // editable. The gate takes no clock, so time can never change the outcome.
+    expect(canMutatePick({ pickResult: "pending" }).ok).toBe(true);
+    // The gate signature carries no time/deadline/fixtures field.
+    expect(Object.keys({ pickResult: "pending" as const })).toEqual([
+      "pickResult",
+    ]);
   });
 
-  it("rejects once the effective deadline has passed (starting_soon)", () => {
-    const gate = canMutatePick({
-      deadline: iso(-2), // deadline passed
-      fixtures: [fx(4)], // no fixture kicked off yet
-      nowMs: NOW,
-      pickResult: "pending",
-    });
+  it("rejects a survived pick — resolved is locked", () => {
+    const gate = canMutatePick({ pickResult: "survived" });
     expect(gate.ok).toBe(false);
-    if (!gate.ok) expect(gate.reason).toMatch(/deadline has passed/i);
+    if (!gate.ok) expect(gate.reason).toMatch(/resolved/i);
   });
 
-  it("rejects once the first kickoff has been reached (in_progress)", () => {
-    const gate = canMutatePick({
-      deadline: iso(-26),
-      fixtures: [fx(-1), fx(2)], // first fixture already kicked off
-      nowMs: NOW,
-      pickResult: "pending",
-    });
+  it("rejects an eliminated pick — resolved is locked", () => {
+    const gate = canMutatePick({ pickResult: "eliminated" });
     expect(gate.ok).toBe(false);
-    if (!gate.ok) expect(gate.reason).toMatch(/has started/i);
+    if (!gate.ok) expect(gate.reason).toMatch(/locked/i);
   });
+});
 
-  it("rejects when the round is complete (all fixtures finished)", () => {
-    const gate = canMutatePick({
-      deadline: iso(-48),
-      fixtures: [fx(-40, true), fx(-38, true)],
-      nowMs: NOW,
-      pickResult: "pending",
-    });
-    expect(gate.ok).toBe(false);
-    if (!gate.ok) expect(gate.reason).toMatch(/is over/i);
+describe("pickLockLabel — shown only for resolved picks", () => {
+  it("labels a survived pick", () => {
+    expect(pickLockLabel("survived")).toMatch(/survived/i);
   });
-
-  it("rejects a resolved pick even while the round still reads as open", () => {
-    // Clock says open, but the pick has already been settled — locked wins.
-    const survived = canMutatePick({
-      deadline: iso(24),
-      fixtures: [fx(30)],
-      nowMs: NOW,
-      pickResult: "survived",
-    });
-    expect(survived.ok).toBe(false);
-    if (!survived.ok) expect(survived.reason).toMatch(/survived/i);
-
-    const eliminated = canMutatePick({
-      deadline: iso(24),
-      fixtures: [fx(30)],
-      nowMs: NOW,
-      pickResult: "eliminated",
-    });
-    expect(eliminated.ok).toBe(false);
-    if (!eliminated.ok) expect(eliminated.reason).toMatch(/settled/i);
-  });
-
-  it("rejects when there are no fixtures to derive status from (unknown)", () => {
-    expect(
-      canMutatePick({
-        deadline: null,
-        fixtures: [],
-        nowMs: NOW,
-        pickResult: "pending",
-      }).ok,
-    ).toBe(false);
+  it("labels an eliminated pick as out", () => {
+    expect(pickLockLabel("eliminated")).toMatch(/out/i);
   });
 });
 

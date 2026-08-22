@@ -196,20 +196,6 @@ function findCompetitionDeadline(
   return competitions.find((c) => c.id === compId)?.nextDeadline ?? null;
 }
 
-// Human-friendly deadline label (e.g. "Sat, Aug 16, 06:30 PM"). Shared by the
-// submit/change confirm sheets so the "changeable until…" copy stays consistent.
-function formatDeadlineLabel(iso: string): string {
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "the deadline";
-  return d.toLocaleString(undefined, {
-    weekday: "short",
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
-
 // ─── Reserve-strategy copy (single source, reused across the add flows and the
 //     competition strategy selector) ─────────────────────────────────────────
 
@@ -735,20 +721,24 @@ export function LmsCanvas({
   const currentPick =
     selectedEntry?.detail.picks.find((p) => p.gw === currentGw) ?? null;
   const alreadyLocked = currentPick != null;
-  // A backed pick can be changed/cancelled only while the round is Open and the
-  // pick is still pending (auto-resolve hasn't settled it). This mirrors the
-  // server-enforced gate in canMutatePick — the server is the authority, this
-  // only decides whether to render the controls.
+  // A backed pick can be changed/cancelled for as long as it is still pending —
+  // before OR after the deadline. The ONLY lock is result-based: once auto-resolve
+  // settles it, it's fixed. This mirrors the server gate in canMutatePick (the
+  // server is the authority; this only decides whether to render the controls).
+  // There is deliberately no deadline/time gate here.
   const pickIsPending = currentPick?.result === "pending";
-  const roundOpen = gwStatus === "open";
-  const canEditPick = alreadyLocked && pickIsPending && roundOpen;
-  // Picks are writable while the round is open (before the deadline). "unknown"
-  // (pre-mount / no fixture data) stays lenient so controls don't flash out.
-  // In `changingPick` mode we re-open the selectors over a backed pick so the
-  // user can choose a replacement (routed through the change-confirm).
-  const canPick =
-    (!alreadyLocked || (changingPick && canEditPick)) &&
-    (gwStatus === "open" || gwStatus === "unknown");
+  const canEditPick = alreadyLocked && pickIsPending;
+  // Past the effective deadline a pending pick stays fully editable; we only show
+  // a soft, non-blocking note. "open"/"unknown" means the deadline hasn't passed
+  // (or isn't known yet), so no note. This is display-only — it never gates.
+  const deadlinePassed =
+    gwStatus === "starting_soon" ||
+    gwStatus === "in_progress" ||
+    gwStatus === "complete";
+  // A round with no pick (or one being changed) can be backed at any time — the
+  // Top-3 + fixture Back buttons stay live regardless of the deadline. The server
+  // remains the authority (it refuses a genuinely finished round).
+  const canPick = !alreadyLocked || (changingPick && canEditPick);
 
   return (
     <div className="pb-24 md:pb-8">
@@ -783,8 +773,8 @@ export function LmsCanvas({
             <BackedPickCard
               pick={currentPick}
               currentGw={currentGw}
-              gwStatus={gwStatus}
               canEdit={canEditPick}
+              deadlinePassed={deadlinePassed}
               changing={changingPick}
               onChange={() => setChangingPick(true)}
               onKeepCurrent={() => setChangingPick(false)}
@@ -886,7 +876,6 @@ export function LmsCanvas({
         pick={confirmPick}
         currentGw={currentGw}
         entryId={selectedEntry?.detail.id ?? null}
-        deadline={nextDeadline?.deadline ?? null}
         onClose={() => setConfirmPick(null)}
         onSubmitted={() => {
           setConfirmPick(null);
@@ -3106,16 +3095,18 @@ function AddEntrySheet({
 
 // ─── Backed-pick card (current round) ─────────────────────────────────────────
 //
-// Shown when the current round already has a pick for this entry. While the
-// round is Open and the pick pending, it offers Change / Cancel (the selectors
-// re-open in `changing` mode). Otherwise the pick is locked — a status label,
-// no controls. Cancelling frees the team back to the available pool; changing
-// swaps it in place. The server re-checks the same gate before mutating.
+// Shown when the current round already has a pick for this entry. While the pick
+// is still pending it offers Change / Cancel (the selectors re-open in `changing`
+// mode) — before OR after the deadline. Once the pick has resolved it's locked —
+// a status label, no controls. Cancelling frees the team back to the available
+// pool; changing swaps it in place. The server re-checks the same result-based
+// gate before mutating. Past the deadline (but still pending) a soft, non-blocking
+// note is shown; it never disables the controls.
 function BackedPickCard({
   pick,
   currentGw,
-  gwStatus,
   canEdit,
+  deadlinePassed,
   changing,
   onChange,
   onKeepCurrent,
@@ -3123,8 +3114,8 @@ function BackedPickCard({
 }: {
   pick: LmsEntryPickView;
   currentGw: number | null;
-  gwStatus: LmsGwStatus;
   canEdit: boolean;
+  deadlinePassed: boolean;
   changing: boolean;
   onChange: () => void;
   onKeepCurrent: () => void;
@@ -3146,10 +3137,16 @@ function BackedPickCard({
         {!canEdit && (
           <Badge tone="gray" className="shrink-0">
             <Lock className="mr-1 inline h-3 w-3" aria-hidden />
-            {pickLockLabel(gwStatus, pick.result)}
+            {pickLockLabel(pick.result)}
           </Badge>
         )}
       </div>
+
+      {canEdit && deadlinePassed && (
+        <p className="mt-3 text-xs text-muted">
+          Deadline passed — only change this if your organiser allows.
+        </p>
+      )}
 
       {canEdit && (
         <>
@@ -3343,8 +3340,8 @@ function CancelConfirmSheet({
           <ClubBadge code={pick?.team?.short_name ?? null} size={44} state="used" />
           <p className="text-sm text-secondary">
             <span className="font-semibold text-primary">{teamName}</span>{" "}
-            returns to your available pool. You can back a different team while the
-            round is still open.
+            returns to your available pool. You can back a different team, or leave
+            this round unpicked for now.
           </p>
         </div>
 
@@ -3381,14 +3378,12 @@ function SubmitConfirmSheet({
   pick,
   currentGw,
   entryId,
-  deadline,
   onClose,
   onSubmitted,
 }: {
   pick: RankedPick | null;
   currentGw: number | null;
   entryId: number | null;
-  deadline: string | null;
   onClose: () => void;
   onSubmitted: () => void;
 }) {
@@ -3444,10 +3439,9 @@ function SubmitConfirmSheet({
 
           {/* Draw = OUT — THE only place this rule appears */}
           <Callout tone="danger" title="Draw = OUT">
-            A draw eliminates you just like a loss — your team must win
-            outright. You can change this pick until the deadline
-            {deadline ? ` (${formatDeadlineLabel(deadline)})` : ""}; it locks
-            when GW{currentGw ?? "?"} starts.
+            A draw eliminates you just like a loss — your team must win outright.
+            This isn&apos;t locked in: you can change or cancel this GW
+            {currentGw ?? "?"} pick any time until the round is played.
           </Callout>
 
           {error && <p className="text-sm text-danger">{error}</p>}

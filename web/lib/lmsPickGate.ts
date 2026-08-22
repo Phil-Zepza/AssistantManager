@@ -1,23 +1,18 @@
-import type { LmsGwStatus, LmsPickResult } from "./types";
-import { deriveGwStatus, type StatusFixture } from "./lmsStatus";
+import type { LmsPickResult } from "./types";
 
-// ─── Pending-pick mutability gate ─────────────────────────────────────────────
+// ─── Pending-pick mutability gate (result-based only) ─────────────────────────
 //
-// A backed pick may be cancelled or switched ONLY while its round is still Open
-// (before the effective deadline / first kickoff) AND the pick is still pending.
-// This is the correctness core shared by the cancelPick / changePick server
-// actions and the competition UI. Pure — same inputs → same output — so it is
-// unit-tested directly and can also drive the client's control visibility. The
-// server re-runs it against freshly-loaded data before any mutation, so a client
-// that renders a control it shouldn't (render-vs-deadline race) is still refused.
+// A backed pick may be cancelled or switched at ANY time — before OR after the
+// deadline — for as long as it is still pending. The ONLY lock is result-based:
+// once auto-resolve settles the pick to 'survived' or 'eliminated' it is fixed.
+// There is deliberately NO time/deadline gate here; the app tracks a changeable
+// pick, it is not the game's source of truth. This is the correctness core shared
+// by the cancelPick / changePick server actions and the competition UI. Pure —
+// same input → same output — so it is unit-tested directly and also drives the
+// client's control visibility. The server re-runs it against the freshly-loaded
+// pick result before any mutation, so it is the authority.
 
 export interface PickMutationInput {
-  /** Effective round deadline (override or computed default), ISO string. */
-  deadline: string | null;
-  /** The round's fixtures (kickoff + finished), for status derivation. */
-  fixtures: ReadonlyArray<StatusFixture>;
-  /** Current time in ms (injected so the gate stays pure/testable). */
-  nowMs: number;
   /** The pick's current result. Only 'pending' picks are mutable. */
   pickResult: LmsPickResult;
 }
@@ -26,61 +21,25 @@ export type PickMutationGate =
   | { ok: true }
   | { ok: false; reason: string };
 
-// User-facing refusal messages. A resolved pick takes precedence over the round
-// status (a settled pick is locked no matter what the clock says).
-function lockedReason(status: LmsGwStatus, result: LmsPickResult): string {
-  if (result === "survived") {
-    return "This pick has already survived — it can't be changed.";
-  }
-  if (result === "eliminated") {
-    return "This pick has already been settled — it can't be changed.";
-  }
-  switch (status) {
-    case "starting_soon":
-      return "This round's deadline has passed — your pick is locked.";
-    case "in_progress":
-      return "This round has started — your pick is locked.";
-    case "complete":
-      return "This round is over — your pick is locked.";
-    default:
-      return "This round is not open — your pick is locked.";
-  }
-}
-
 /**
- * Decide whether a pending pick on this round may be cancelled or changed.
- * Allowed only when the round derives to "open" AND the pick is "pending".
+ * Decide whether a pick on this round may be cancelled or changed. Allowed
+ * whenever the pick is still 'pending' — the deadline and round status are
+ * irrelevant. Rejected only once the pick has resolved.
  */
 export function canMutatePick(input: PickMutationInput): PickMutationGate {
-  const status = deriveGwStatus({
-    deadline: input.deadline,
-    fixtures: input.fixtures,
-    nowMs: input.nowMs,
-  });
-  if (status === "open" && input.pickResult === "pending") return { ok: true };
-  return { ok: false, reason: lockedReason(status, input.pickResult) };
+  if (input.pickResult === "pending") return { ok: true };
+  return { ok: false, reason: "This round has resolved — the pick is locked." };
 }
 
 /**
- * Short label for a locked backed-pick card in the UI (no change/cancel
- * controls). Mirrors canMutatePick's reasoning but phrased as a status chip.
+ * Short label for a locked backed-pick card in the UI (shown only once the pick
+ * has resolved, when no change/cancel controls are offered).
  */
-export function pickLockLabel(
-  status: LmsGwStatus,
-  result: LmsPickResult,
-): string {
+export function pickLockLabel(result: LmsPickResult): string {
   if (result === "survived") return "Locked — survived";
   if (result === "eliminated") return "Locked — out";
-  switch (status) {
-    case "starting_soon":
-      return "Locked — the deadline has passed";
-    case "in_progress":
-      return "Locked — the round has started";
-    case "complete":
-      return "Locked — the round is over";
-    default:
-      return "Locked";
-  }
+  // A pending pick is never locked; this branch is defensive only.
+  return "Locked";
 }
 
 // ─── Change-target validation ─────────────────────────────────────────────────
